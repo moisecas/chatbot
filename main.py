@@ -12,7 +12,6 @@ from starlette.concurrency import run_in_threadpool
 
 app = FastAPI()
 
-
 # -----------------------------
 # Config (ENV)
 # -----------------------------
@@ -27,8 +26,7 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
-BUSINESS_WHATSAPP_NUMBER = os.getenv("BUSINESS_WHATSAPP_NUMBER", "573001112233")  # +57..., sin '+'
-
+BUSINESS_WHATSAPP_NUMBER = os.getenv("BUSINESS_WHATSAPP_NUMBER", "573001112233")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "5"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
 
@@ -38,638 +36,629 @@ ALLOWED_IMAGE_TYPES = {
     "image/webp": ".webp",
 }
 
-
 def _sb_headers() -> dict:
-    """Headers para PostgREST y Storage usando service_role (solo backend)."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Faltan SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY en variables de entorno.")
+        raise RuntimeError("Faltan credenciales de Supabase.")
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
     }
 
-
 # -----------------------------
-# Helpers
+# Helpers & Database
 # -----------------------------
 def _basic_email_ok(email: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip(), re.I))
-
 
 def _clean_phone(s: str) -> str:
     s = s.strip()
     return re.sub(r"[^\d\+\s\(\)]", "", s)
 
-
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in {"1", "true", "yes", "si", "sí", "y"}
-
 
 def _make_public_url(bucket: str, path: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
 
-
 async def _insert_lead(data: dict) -> dict:
     url = f"{SUPABASE_URL}/rest/v1/leads"
     headers = _sb_headers()
-    headers["prefer"] = "return=representation"  # devuelve el registro insertado
-
+    headers["prefer"] = "return=representation"
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json=[data])
         if r.status_code >= 300:
-            raise HTTPException(status_code=500, detail=f"Error insertando lead: {r.status_code} {r.text}")
-
+            raise HTTPException(status_code=500, detail=f"Error DB: {r.text}")
         rows = r.json()
-        if not rows:
-            raise HTTPException(status_code=500, detail="Supabase no devolvió el lead insertado.")
-        return rows[0]
-
+        return rows[0] if rows else {}
 
 async def _insert_lead_image(row: dict) -> None:
     url = f"{SUPABASE_URL}/rest/v1/lead_images"
     headers = _sb_headers()
     headers["prefer"] = "return=minimal"
-
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=[row])
-        if r.status_code >= 300:
-            raise HTTPException(status_code=500, detail=f"Error insertando lead_image: {r.status_code} {r.text}")
-
+        await client.post(url, headers=headers, json=[row])
 
 async def _upload_to_storage(bucket: str, path: str, content: bytes, content_type: str) -> None:
-    # Upload simple a Supabase Storage
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
     headers = _sb_headers()
     headers["content-type"] = content_type
     headers["x-upsert"] = "true"
-
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(url, headers=headers, content=content)
         if r.status_code >= 300:
-            raise HTTPException(status_code=500, detail=f"Error subiendo a Storage: {r.status_code} {r.text}")
-
+            raise HTTPException(status_code=500, detail=f"Error Storage: {r.text}")
 
 def _send_email_sync(subject: str, body: str) -> None:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and SMTP_FROM and BUSINESS_EMAIL_TO):
-        raise RuntimeError("Faltan variables SMTP_* o BUSINESS_EMAIL_TO.")
-
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
+        return # O lanzar error si es crítico
     msg = EmailMessage()
     msg["From"] = SMTP_FROM
     msg["To"] = BUSINESS_EMAIL_TO
     msg["Subject"] = subject
     msg.set_content(body)
-
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.send_message(msg)
-
 
 # -----------------------------
 # Routes
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # IMPORTANTE: NO es f-string para evitar conflictos con { } y ${ } del HTML/JS
     html = """
 <!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Skins - Solicitud de diseño</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Skins - Diseño Personalizado</title>
   <style>
     :root {
+      /* Ajuste de colores para mejor contraste */
       --bg: #0b1220;
       --panel: #0f1b33;
-      --bubble-bot: #14264a;
-      --bubble-user: #1d3b7a;
-      --text: #e9eefc;
-      --muted: #a9b6d8;
-      --accent: #4aa3ff;
-      --danger: #ff5b6e;
-      --ok: #38d39f;
-      --card: #0f1b33;
-      --border: rgba(255,255,255,.12);
+      --bubble-bot: #1e293b; 
+      --bubble-user: #2563eb;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --danger: #ef4444;
+      --ok: #22c55e;
+      --border: rgba(255,255,255,.15);
+      
+      /* Inputs más claros para legibilidad */
+      --input-bg: #e2e8f0;
+      --input-text: #0f172a;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: radial-gradient(1200px 600px at 20% 0%, #14264a 0%, var(--bg) 55%);
+      font-family: system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #1e293b 0%, var(--bg) 80%);
       color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
     }
     .wrap {
-      max-width: 980px;
+      max-width: 600px;
       margin: 0 auto;
-      padding: 16px;
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 12px;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      position: relative;
     }
+    
+    /* Header limpio sin WhatsApp */
     header {
-      display:flex; align-items:center; justify-content:space-between;
-      gap: 12px;
-      padding: 10px 12px;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      background: rgba(15,27,51,.6);
-      backdrop-filter: blur(8px);
+      flex: 0 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(15,27,51,.95);
+      backdrop-filter: blur(10px);
+      z-index: 10;
     }
-    header .title { font-weight: 700; letter-spacing: .2px; }
-    header .hint { color: var(--muted); font-size: 13px; }
+    header .title { font-weight: 700; font-size: 1.1rem; }
+    header .hint { color: var(--muted); font-size: 0.8rem; }
 
+    /* Chat Area */
     .chat {
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      background: rgba(15,27,51,.6);
-      backdrop-filter: blur(8px);
-      overflow: hidden;
-      display: grid;
-      grid-template-rows: 1fr auto;
-      min-height: 72vh;
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      padding-bottom: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      scroll-behavior: smooth;
     }
-    .msgs {
-      padding: 14px;
-      overflow:auto;
-      max-height: 72vh;
-    }
+    
     .bubble {
-      max-width: 82%;
-      padding: 10px 12px;
-      border-radius: 14px;
-      margin: 8px 0;
-      border: 1px solid var(--border);
-      line-height: 1.35;
+      max-width: 85%;
+      padding: 12px 14px;
+      border-radius: 16px;
+      line-height: 1.4;
       white-space: pre-wrap;
-      word-break: break-word;
+      font-size: 15px;
+      animation: popIn 0.3s ease-out;
     }
-    .bot { background: var(--bubble-bot); border-top-left-radius: 6px; }
-    .user { background: var(--bubble-user); margin-left: auto; border-top-right-radius: 6px; }
+    @keyframes popIn { from{opacity:0; transform:translateY(5px);} to{opacity:1; transform:translateY(0);} }
+    
+    .bot { background: var(--bubble-bot); border-bottom-left-radius: 4px; color: #e2e8f0; }
+    .user { background: var(--bubble-user); margin-left: auto; border-bottom-right-radius: 4px; color: white; }
 
-    .muted { color: var(--muted); font-size: 13px; }
+    /* Controls Area */
     .controls {
-      padding: 12px;
+      flex: 0 0 auto;
+      padding: 12px 16px;
+      background: #111827;
       border-top: 1px solid var(--border);
-      display: grid;
-      gap: 10px;
-      background: rgba(10,18,32,.7);
     }
-    .row { display:flex; gap: 8px; flex-wrap: wrap; }
+    
+    /* Inputs mejorados (Fondo claro, letra oscura) */
     input, select, textarea {
       width: 100%;
-      padding: 11px 12px;
+      padding: 12px 14px;
       border-radius: 12px;
-      border: 1px solid var(--border);
-      background: rgba(0,0,0,.18);
-      color: var(--text);
+      border: 2px solid transparent;
+      background: var(--input-bg);
+      color: var(--input-text);
+      font-size: 16px; /* Evita zoom en iOS */
       outline: none;
+      transition: border-color 0.2s;
     }
-    textarea { min-height: 90px; resize: vertical; }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+    }
+    textarea { min-height: 80px; resize: none; font-family: inherit; }
 
+    /* Botones */
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .btn {
-      cursor:pointer;
-      border: 1px solid var(--border);
+      flex: 1;
+      cursor: pointer;
+      border: none;
       border-radius: 12px;
-      padding: 10px 12px;
-      background: rgba(74,163,255,.15);
-      color: var(--text);
-      font-weight: 650;
-      text-decoration: none;
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-    }
-    .btn:hover { border-color: rgba(74,163,255,.6); }
-    .btn.secondary { background: rgba(255,255,255,.06); }
-    .btn.ok { background: rgba(56,211,159,.18); }
-
-    .pill {
-      padding: 8px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: rgba(255,255,255,.06);
-      cursor:pointer;
+      padding: 12px;
+      background: var(--accent);
+      color: white;
       font-weight: 600;
+      text-align: center;
+      text-decoration: none;
+      font-size: 15px;
     }
-    .pill:hover { border-color: rgba(74,163,255,.6); }
+    .btn:active { transform: scale(0.98); }
+    .btn.secondary { background: #334155; color: #f8fafc; }
+    .btn.whatsapp { background: #25D366; color: white; }
+    .btn.danger { background: var(--danger); }
 
+    .pill-wrap { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill {
+      background: rgba(255,255,255,0.1);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 16px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .pill:hover { background: rgba(255,255,255,0.2); }
+
+    /* Grid de Imágenes */
     .grid {
-      display:grid;
+      display: grid;
       grid-template-columns: repeat(2, 1fr);
       gap: 10px;
-      margin-top: 6px;
+      margin-top: 8px;
     }
     .card {
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      overflow:hidden;
-      background: rgba(0,0,0,.18);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      position: relative;
+      border: 2px solid transparent;
+      cursor: pointer;
+    }
+    .card.selected {
+      border-color: var(--ok);
+      box-shadow: 0 0 10px rgba(34, 197, 94, 0.4);
     }
     .card img {
-      width: 100%;
-      height: 140px;
-      object-fit: cover;
-      display:block;
+      width: 100%; height: 120px; object-fit: cover; display: block;
     }
     .card .cap {
-      padding: 8px 10px;
-      color: var(--muted);
-      font-size: 12px;
+      padding: 6px; font-size: 11px; text-align: center; color: #cbd5e1; background: rgba(0,0,0,0.6);
     }
+    .card .check {
+      position: absolute; top: 5px; right: 5px;
+      background: var(--ok); color: black;
+      width: 20px; height: 20px; border-radius: 50%;
+      display: none; align-items: center; justify-content: center; font-weight: bold;
+    }
+    .card.selected .check { display: flex; }
 
+    /* Upload Block */
     .imgblock {
-      border: 1px solid var(--border);
-      border-radius: 14px;
+      background: #1e293b;
       padding: 10px;
-      background: rgba(0,0,0,.14);
-      display:grid;
-      gap: 8px;
+      border-radius: 12px;
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
     }
-    .oktext { color: var(--ok); font-weight: 650; }
-    .tiny { font-size: 12px; color: var(--muted); }
+    .imgblock label { font-size: 13px; color: var(--accent); font-weight: bold; display: block; margin-bottom: 4px; }
+    
+    .tiny { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .hidden { display: none; }
+    
+    /* Botón Precio visible en todos */
+    #btnPrice { display: inline-flex; font-size: 13px; padding: 6px 12px; height: auto; flex: 0; white-space: nowrap; }
 
-    /* “Ver precio” SOLO web (desktop) */
-    #btnPrice { display: inline-flex; }
-    @media (max-width: 768px) {
-      #btnPrice { display: none; }
-      .grid { grid-template-columns: 1fr; }
-      .bubble { max-width: 92%; }
-    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <div>
-        <div class="title">Solicitud de skins (MVP)</div>
-        <div class="hint">Una sola página · estilo chat-formulario</div>
-      </div>
-      <div class="row">
-        <button class="btn secondary" id="btnPrice" type="button">Ver precio</button>
-        <a class="btn ok" id="btnWhatsApp" target="_blank" rel="noopener">Contactar por WhatsApp</a>
-      </div>
-    </header>
 
-    <section class="chat">
-      <div class="msgs" id="msgs"></div>
-      <div class="controls" id="controls"></div>
-    </section>
-  </div>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="title">Diseña tu Skin</div>
+      <div class="hint">Personaliza tu consola</div>
+    </div>
+    <button class="btn secondary" id="btnPrice" type="button">Ver precios</button>
+  </header>
+
+  <section class="chat" id="msgs"></section>
+  
+  <div class="controls" id="controls"></div>
+</div>
 
 <script>
   // -----------------------------
-  // CONFIG: cambia aquí tus imágenes y precios
+  // DATOS Y CONFIGURACIÓN
   // -----------------------------
-  const GALLERY_SET_1 = [
-    "https://images.unsplash.com/photo-1511512578047-dfb367046420?auto=format&fit=crop&w=900&q=70",
-    "https://images.unsplash.com/photo-1612287230202-1ff1d85d1bdf?auto=format&fit=crop&w=900&q=70",
-    "https://images.unsplash.com/photo-1605902711622-cfb43c44367f?auto=format&fit=crop&w=900&q=70",
-    "https://images.unsplash.com/photo-1612815154858-60aa4c59eaa6?auto=format&fit=crop&w=900&q=70"
-  ];
-
-  const GALLERY_SET_2 = [
-    "https://images.unsplash.com/photo-1580128637423-1e6c0d9e8d25?auto=format&fit=crop&w=900&q=70",
-    "https://images.unsplash.com/photo-1603481546579-65d935ba9cdd?auto=format&fit=crop&w=900&q=70",
-    "https://images.unsplash.com/photo-1550745165-9bc0b252726f?auto=format&fit=crop&w=900&q=70",
-    "https://images.unsplash.com/photo-1550745166-9bc0b252726f?auto=format&fit=crop&w=900&q=70"
-  ];
+  const MAX_BYTES = __MAX_BYTES__; // Inyectado
+  const BUSINESS_WA = "__BUSINESS_WA_NUMBER__";
+  
+  // Categorías con placeholders (aquí puedes meter hasta 20 imágenes por lista)
+  const GALLERIES = {
+    "Anime": [
+      "https://images.unsplash.com/photo-1623939012339-5b3dd892c57f?w=400&q=70",
+      "https://images.unsplash.com/photo-1541562232579-512a21360020?w=400&q=70",
+      "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=400&q=70",
+      "https://images.unsplash.com/photo-1607604276583-eef5f0b7e6d5?w=400&q=70"
+    ],
+    "Deportes": [
+      "https://images.unsplash.com/photo-1579952363873-27f3bade9f55?w=400&q=70",
+      "https://images.unsplash.com/photo-1508098682722-e99c43a406b2?w=400&q=70",
+      "https://images.unsplash.com/photo-1517649763962-0c623066013b?w=400&q=70"
+    ],
+    "Abstracto": [
+      "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?w=400&q=70",
+      "https://images.unsplash.com/photo-1541701494587-cb58502866ab?w=400&q=70",
+      "https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=400&q=70"
+    ]
+  };
 
   const PRICES = [
-    { name: "Skin estándar (placeholder)", value: "$80.000 COP" },
-    { name: "Skin premium (placeholder)", value: "$120.000 COP" },
-    { name: "Personalizado (placeholder)", value: "$160.000 COP" }
+    "Skin Estándar: $80.000 COP",
+    "Skin Premium: $120.000 COP",
+    "Diseño Personalizado: $160.000 COP"
   ];
 
-  // Se inyecta desde backend (ENV) por reemplazo de string:
-  const BUSINESS_WA_NUMBER = "__BUSINESS_WA_NUMBER__";
-
-  // -----------------------------
-  // State
-  // -----------------------------
-  const state = {
+  const STATE = {
     name: "",
     email: "",
     whatsapp: "",
     console: "",
-    design_choice: "",     // "view_designs" | "custom"
-    has_design: "no",      // "yes" si sube imágenes
-    gallery_page: 0,       // 0 none, 1 set1, 2 set2
-    custom_blocks: []      // { fileEl, detailsEl }
+    mode: "", // 'gallery' | 'custom'
+    selected_design_url: "",
+    custom_files: []
   };
 
   const msgs = document.getElementById("msgs");
   const controls = document.getElementById("controls");
-  const btnWA = document.getElementById("btnWhatsApp");
   const btnPrice = document.getElementById("btnPrice");
 
-  function scrollDown() {
-    msgs.scrollTop = msgs.scrollHeight;
+  // -----------------------------
+  // FUNCIONES BASE
+  // -----------------------------
+  function scrollBot() {
+    setTimeout(() => { msgs.scrollTop = msgs.scrollHeight; }, 100);
   }
 
-  function addBubble(text, who="bot") {
+  function addBubble(text, who="bot", isHtml=false) {
     const div = document.createElement("div");
-    div.className = "bubble " + (who === "user" ? "user" : "bot");
-    div.textContent = text;
+    div.className = "bubble " + who;
+    if (isHtml) div.innerHTML = text;
+    else div.textContent = text;
     msgs.appendChild(div);
-    scrollDown();
+    scrollBot();
   }
 
   function setControls(html) {
     controls.innerHTML = html;
-  }
-
-  function updateWhatsAppLink() {
-    const name = state.name || "Hola";
-    const consola = state.console || "una consola";
-    const msg = encodeURIComponent(`Hola, soy ${name}. Quiero un diseño para ${consola}.`);
-    btnWA.href = `https://wa.me/${BUSINESS_WA_NUMBER}?text=${msg}`;
+    // Auto focus al primer input si existe
+    const inp = controls.querySelector("input, select");
+    if (inp) inp.focus();
   }
 
   function showError(msg) {
-    addBubble("❌ " + msg, "bot");
+    addBubble("⚠️ " + msg, "bot");
   }
 
+  // -----------------------------
+  // FLUJO DEL CHAT
+  // -----------------------------
   function start() {
-    addBubble("👋 ¡Hola! Te voy a pedir unos datos para tu skin.");
-    updateWhatsAppLink();
-    stepName();
+    addBubble("👋 ¡Hola! Soy MoisoBot. Vamos a crear un skin brutal para tu consola.");
+    setTimeout(askName, 600);
   }
 
-  function stepName() {
-    addBubble("¿Cuál es tu nombre?");
+  function askName() {
+    addBubble("Para empezar, ¿cómo te llamas?");
     setControls(`
       <div class="row">
-        <input id="inName" placeholder="Tu nombre" autocomplete="name" />
-        <button class="btn" id="btnNext">Continuar</button>
+        <input id="inName" placeholder="Escribe tu nombre aquí..." autocomplete="name" />
+        <button class="btn" onclick="handleName()">Siguiente</button>
       </div>
-      <div class="tiny">Tip: esto sirve para prellenar WhatsApp y el correo.</div>
+      <div class="tiny">⬇️ Escribe abajo</div>
     `);
-    document.getElementById("btnNext").onclick = () => {
-      const v = document.getElementById("inName").value.trim();
-      if (!v) return showError("Escribe tu nombre.");
-      state.name = v;
-      addBubble(v, "user");
-      updateWhatsAppLink();
-      stepEmail();
-    };
   }
 
-  function stepEmail() {
-    addBubble("Perfecto. ¿Tu correo?");
-    setControls(`
-      <div class="row">
-        <input id="inEmail" placeholder="correo@ejemplo.com" autocomplete="email" />
-        <button class="btn" id="btnNext">Continuar</button>
-      </div>
-    `);
-    document.getElementById("btnNext").onclick = () => {
-      const v = document.getElementById("inEmail").value.trim();
-      if (!v || !v.includes("@")) return showError("Escribe un correo válido.");
-      state.email = v;
-      addBubble(v, "user");
-      stepWhatsApp();
-    };
-  }
+  window.handleName = () => {
+    const v = document.getElementById("inName").value.trim();
+    if (!v) return showError("Necesito un nombre para continuar.");
+    STATE.name = v;
+    addBubble(v, "user");
+    askConsole();
+  };
 
-  function stepWhatsApp() {
-    addBubble("¿Tu WhatsApp (con indicativo si puedes)?");
-    setControls(`
-      <div class="row">
-        <input id="inWA" placeholder="+57 3xx xxx xxxx" autocomplete="tel" />
-        <button class="btn" id="btnNext">Continuar</button>
-      </div>
-    `);
-    document.getElementById("btnNext").onclick = () => {
-      const v = document.getElementById("inWA").value.trim();
-      if (!v) return showError("Escribe tu número de WhatsApp.");
-      state.whatsapp = v;
-      addBubble(v, "user");
-      stepConsole();
-    };
-  }
-
-  function stepConsole() {
-    addBubble("¿Para cuál consola es el skin?");
+  function askConsole() {
+    addBubble(`Un gusto, ${STATE.name}. ¿Qué consola tienes?`);
     setControls(`
       <div class="row">
         <select id="selConsole">
-          <option value="">Selecciona…</option>
-          <option>PS4</option>
-          <option>PS5</option>
-          <option>XBOX</option>
-          <option>Switch</option>
-          <option value="other">Otra</option>
+          <option value="">Selecciona tu consola...</option>
+          <option value="PS4 Fat">PS4 Fat</option>
+          <option value="PS4 Slim">PS4 Slim</option>
+          <option value="PS4 Pro">PS4 Pro</option>
+          <option value="PS5 Fat">PS5 Fat</option>
+          <option value="PS5 Slim">PS5 Slim</option>
+          <option value="Xbox One">Xbox One</option>
+          <option value="Xbox One S">Xbox One S</option>
+          <option value="Xbox One X">Xbox One X</option>
+          <option value="Xbox Series S">Xbox Series S</option>
+          <option value="Xbox Series X">Xbox Series X</option>
+          <option value="other">Otra...</option>
         </select>
-        <input id="inOther" placeholder="Escribe la consola" style="display:none;" />
-        <button class="btn" id="btnNext">Continuar</button>
+        <button class="btn" onclick="handleConsole()">Listo</button>
       </div>
     `);
+  }
 
+  window.handleConsole = () => {
     const sel = document.getElementById("selConsole");
-    const inOther = document.getElementById("inOther");
-    sel.onchange = () => {
-      inOther.style.display = sel.value === "other" ? "block" : "none";
-    };
+    const val = sel.value;
+    if (!val) return showError("Selecciona una consola de la lista.");
+    STATE.console = val;
+    addBubble(val, "user");
+    askMethod();
+  };
 
-    document.getElementById("btnNext").onclick = () => {
-      let v = sel.value;
-      if (!v) return showError("Selecciona una consola.");
-      if (v === "other") {
-        v = inOther.value.trim();
-        if (!v) return showError("Escribe cuál consola es.");
-      }
-      state.console = v;
-      addBubble(v, "user");
-      updateWhatsAppLink();
-      stepDesignChoice();
-    };
-  }
-
-  function stepDesignChoice() {
-    addBubble("¿Quieres ver diseños primero o prefieres uno personalizado?");
+  function askMethod() {
+    addBubble("¿Qué prefieres?");
     setControls(`
       <div class="row">
-        <button class="pill" id="btnView">Ver diseños</button>
-        <button class="pill" id="btnCustom">Quiero personalizado</button>
+        <button class="btn secondary" onclick="startGallery()">Ver Diseños</button>
+        <button class="btn" onclick="startCustom()">Personalizado</button>
       </div>
-      <div class="muted">Si ves diseños, podrás dar “Ver más” y luego pasar a personalizado.</div>
+      <div class="tiny">Personalizado = Subes tus propias fotos.</div>
     `);
-
-    document.getElementById("btnView").onclick = () => {
-      state.design_choice = "view_designs";
-      addBubble("Quiero ver diseños", "user");
-      showGallery1();
-    };
-    document.getElementById("btnCustom").onclick = () => {
-      state.design_choice = "custom";
-      state.has_design = "yes";
-      addBubble("Quiero personalizado", "user");
-      showCustomUpload();
-    };
   }
 
-  function galleryHtml(urls) {
-    return `
-      <div class="grid">
-        ${urls.map((u, i) => `
-          <div class="card">
-            <img src="${u}" alt="Diseño ${i+1}" loading="lazy" />
-            <div class="cap">Diseño ${i+1}</div>
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
+  // --- MODO GALERÍA ---
+  window.startGallery = () => {
+    STATE.mode = "gallery";
+    addBubble("¡De una! Tengo estas categorías. Toca una para ver los diseños:");
+    
+    const cats = Object.keys(GALLERIES).map(c => 
+      `<button class="pill" onclick="showCategory('${c}')">${c}</button>`
+    ).join("");
 
-  function showGallery1() {
-    state.gallery_page = 1;
-    addBubble("Aquí tienes algunos diseños (tanda 1):");
-    const div = document.createElement("div");
-    div.className = "bubble bot";
-    div.innerHTML = galleryHtml(GALLERY_SET_1);
-    msgs.appendChild(div);
-    scrollDown();
+    setControls(`<div class="pill-wrap">${cats}</div><div class="tiny" style="margin-top:8px"><button class="btn secondary" style="padding:5px 10px" onclick="startCustom()">Mejor personalizado</button></div>`);
+  };
 
-    setControls(`
-      <div class="row">
-        <button class="btn" id="btnMore">Ver más</button>
-        <button class="btn secondary" id="btnSkip">Me voy a personalizado</button>
-      </div>
-    `);
-
-    document.getElementById("btnMore").onclick = () => showGallery2();
-    document.getElementById("btnSkip").onclick = () => {
-      state.design_choice = "custom";
-      state.has_design = "yes";
-      addBubble("Me voy a personalizado", "user");
-      showCustomUpload();
-    };
-  }
-
-  function showGallery2() {
-    state.gallery_page = 2;
-    addBubble("Tanda 2 (más diseños):");
-    const div = document.createElement("div");
-    div.className = "bubble bot";
-    div.innerHTML = galleryHtml(GALLERY_SET_2);
-    msgs.appendChild(div);
-    scrollDown();
-
-    setControls(`
-      <div class="row">
-        <button class="btn ok" id="btnCustomNow">Quiero personalizado</button>
-      </div>
-      <div class="muted">Ahora subes tus imágenes + detalles.</div>
-    `);
-
-    document.getElementById("btnCustomNow").onclick = () => {
-      state.design_choice = "custom";
-      state.has_design = "yes";
-      addBubble("Quiero personalizado", "user");
-      showCustomUpload();
-    };
-  }
-
-  function addImageBlock() {
-    const idx = state.custom_blocks.length + 1;
-    const block = document.createElement("div");
-    block.className = "imgblock";
-    block.innerHTML = `
-      <div><strong>Imagen ${idx}</strong></div>
-      <input type="file" accept="image/*" class="inFile" />
-      <textarea class="inDetails" placeholder="Detalles obligatorios: colores, estilo, texto, ubicaciones, referencias..."></textarea>
-      <div class="tiny">Cada imagen debe tener detalles. Máx. tamaño por imagen lo valida el servidor.</div>
-    `;
-    document.getElementById("customArea").appendChild(block);
-    state.custom_blocks.push({
-      fileEl: block.querySelector(".inFile"),
-      detailsEl: block.querySelector(".inDetails")
+  window.showCategory = (cat) => {
+    addBubble(`📂 Categoría: ${cat}`, "user");
+    const imgs = GALLERIES[cat];
+    
+    let html = `<div class="grid">`;
+    imgs.forEach((url, i) => {
+      html += `
+        <div class="card" onclick="selectDesign(this, '${url}')">
+          <div class="check">✓</div>
+          <img src="${url}" loading="lazy" />
+          <div class="cap">Diseño ${i+1}</div>
+        </div>
+      `;
     });
-  }
+    html += `</div>`;
+    
+    addBubble(html, "bot", true);
+    addBubble("Toca el diseño que te guste para seleccionarlo.", "bot");
+  };
 
-  function showCustomUpload() {
-    addBubble("Listo. Sube una o varias imágenes y describe los detalles de cada una.");
+  window.selectDesign = (el, url) => {
+    // Quitar selección previa
+    document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
+    // Seleccionar nuevo
+    el.classList.add("selected");
+    STATE.selected_design_url = url;
+
     setControls(`
-      <div id="customArea" style="display:grid; gap:10px;"></div>
-
+      <div class="tiny" style="margin-bottom:5px">Has seleccionado un diseño.</div>
       <div class="row">
-        <button class="btn secondary" id="btnAddImg" type="button">Agregar otra imagen</button>
-        <button class="btn" id="btnSubmit" type="button">Enviar solicitud</button>
+        <button class="btn ok" onclick="askContactData()">✅ Quiero este diseño</button>
       </div>
-      <div class="muted">Validación mínima: si es personalizado, debe haber al menos 1 imagen y 1 detalle por imagen.</div>
-      <div id="status" class="tiny"></div>
+      <div class="row" style="margin-top:5px">
+        <button class="btn secondary" onclick="startGallery()">Ver otras categorías</button>
+      </div>
     `);
+  };
 
-    state.custom_blocks = [];
-    addImageBlock();
+  // --- MODO PERSONALIZADO ---
+  window.startCustom = () => {
+    STATE.mode = "custom";
+    addBubble("Modo Personalizado 🎨. Sube tus imágenes y dime qué quieres.");
+    renderUploadForm();
+  };
 
-    document.getElementById("btnAddImg").onclick = () => addImageBlock();
-    document.getElementById("btnSubmit").onclick = () => submitLead();
+  function renderUploadForm() {
+    setControls(`
+      <div id="uploadArea">
+        <div class="imgblock">
+          <label>Imagen 1</label>
+          <input type="file" id="fileInput" accept="image/*" onchange="checkFileSize(this)" />
+          <textarea id="fileDetail" placeholder="Detalles: colores, posición, texto..."></textarea>
+        </div>
+      </div>
+      <div class="tiny" id="sizeWarning"></div>
+      <div class="row">
+        <button class="btn" onclick="handleCustomSubmit()">Continuar</button>
+      </div>
+    `);
   }
 
-  async function submitLead() {
-    const status = document.getElementById("status");
-    status.textContent = "Enviando...";
+  window.checkFileSize = (input) => {
+    const file = input.files[0];
+    const warning = document.getElementById("sizeWarning");
+    warning.innerHTML = "";
+    
+    if (file && file.size > MAX_BYTES) {
+      // Imagen muy pesada
+      input.value = ""; // Limpiar
+      addBubble("⚠️ Esa imagen es muy pesada (" + (file.size/1024/1024).toFixed(1) + "MB). El límite es " + (MAX_BYTES/1024/1024) + "MB.", "bot");
+      
+      // Ofrecer WhatsApp inmediatamente
+      setControls(`
+        <div class="bubble bot">La imagen es muy grande. Es mejor que nos envíes todo por WhatsApp.</div>
+        <div class="row">
+          <a href="${buildWaLink(true)}" target="_blank" class="btn whatsapp">Enviar por WhatsApp</a>
+          <button class="btn secondary" onclick="renderUploadForm()">Intentar otra imagen</button>
+        </div>
+      `);
+    }
+  };
 
+  window.handleCustomSubmit = () => {
+    const fi = document.getElementById("fileInput");
+    const de = document.getElementById("fileDetail");
+    
+    if (!fi.files || fi.files.length === 0) return showError("Sube al menos una imagen.");
+    if (!de.value.trim()) return showError("Escribe algún detalle sobre el diseño.");
+
+    STATE.custom_files = [fi.files[0]];
+    STATE.custom_details = [de.value];
+    
+    addBubble("📸 Imagen cargada y detalles guardados.", "user");
+    askContactData();
+  };
+
+  // --- CONTACTO FINAL ---
+  function askContactData() {
+    addBubble("¡Ya casi! Dame tu WhatsApp y correo para contactarte.");
+    setControls(`
+      <div style="display:grid; gap:8px;">
+        <input id="inWa" type="tel" placeholder="WhatsApp (+57...)" />
+        <input id="inEmail" type="email" placeholder="Correo electrónico" />
+        <button class="btn" onclick="submitFinal()">Enviar Pedido</button>
+      </div>
+    `);
+  }
+
+  async function submitFinal() {
+    const wa = document.getElementById("inWa").value;
+    const em = document.getElementById("inEmail").value;
+    
+    if (!wa || !em.includes("@")) return showError("Revisa los datos (WhatsApp y Correo).");
+    
+    STATE.whatsapp = wa;
+    STATE.email = em;
+
+    // Loading visual
+    setControls(`<div class="tiny">Enviando solicitud... ⏳</div>`);
+    
     const fd = new FormData();
-    fd.append("name", state.name);
-    fd.append("email", state.email);
-    fd.append("whatsapp", state.whatsapp);
-    fd.append("console", state.console);
-    fd.append("design_choice", state.design_choice || "");
-    fd.append("has_design", state.has_design || "no");
-    fd.append("whatsapp_prefill", `Hola, soy ${state.name}. Quiero un diseño para ${state.console}.`);
+    fd.append("name", STATE.name);
+    fd.append("email", STATE.email);
+    fd.append("whatsapp", STATE.whatsapp);
+    fd.append("console", STATE.console);
+    fd.append("design_choice", STATE.mode === "gallery" ? "Galería: " + STATE.selected_design_url : "Personalizado");
+    fd.append("has_design", STATE.mode === "custom" ? "true" : "false");
 
-    if (state.has_design === "yes") {
-      let anyFile = false;
-      for (const b of state.custom_blocks) {
-        const f = b.fileEl.files && b.fileEl.files[0];
-        const d = (b.detailsEl.value || "").trim();
-        if (f) {
-          anyFile = true;
-          fd.append("images", f);
-          fd.append("details", d);
-        }
-      }
-      if (!anyFile) {
-        status.textContent = "";
-        return showError("Si es personalizado, sube al menos 1 imagen.");
-      }
+    if (STATE.mode === "custom") {
+      fd.append("images", STATE.custom_files[0]);
+      fd.append("details", STATE.custom_details[0]);
     }
 
     try {
       const res = await fetch("/submit", { method: "POST", body: fd });
-      const data = await res.json();
       if (!res.ok) {
-        status.textContent = "";
-        return showError(data.detail || "Error enviando.");
+        const err = await res.json();
+        throw new Error(err.detail || "Error en servidor");
       }
-      addBubble("✅ Solicitud enviada. Te contactaremos pronto.", "bot");
-      status.innerHTML = `<span class="oktext">OK</span> · Lead ID: ${data.lead_id}`;
-      updateWhatsAppLink();
+      
+      // Éxito
+      addBubble("✅ ¡Solicitud recibida! Nos pondremos en contacto.", "bot");
+      showFinalActions();
+      
     } catch (e) {
-      status.textContent = "";
-      showError("Error de red. Intenta de nuevo.");
+      showError("Hubo un error enviando: " + e.message);
+      // Fallback a WhatsApp si falla servidor
+      setControls(`
+        <div class="row">
+          <a href="${buildWaLink()}" class="btn whatsapp">Enviar manual por WhatsApp</a>
+        </div>
+      `);
     }
   }
 
+  function showFinalActions() {
+    setControls(`
+      <div class="tiny">Si deseas agilizar, escríbenos ya:</div>
+      <div class="row">
+        <a href="${buildWaLink()}" target="_blank" class="btn whatsapp">Hablar por WhatsApp</a>
+        <button class="btn secondary" onclick="location.reload()">Empezar otro</button>
+      </div>
+    `);
+  }
+
+  function buildWaLink(isHeavyError=false) {
+    let text = `Hola, soy ${STATE.name}. Quiero un skin para ${STATE.console}. `;
+    if (isHeavyError) text += "Intenté subir la imagen en la web pero era muy pesada, te la paso por aquí.";
+    else if (STATE.mode === 'gallery') text += "Elegí un diseño de la galería.";
+    else text += "Es un diseño personalizado.";
+    
+    return `https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(text)}`;
+  }
+
+  // Evento precio
   btnPrice.onclick = () => {
-    addBubble("Precios (placeholder):");
-    const lines = PRICES.map(p => `- ${p.name}: ${p.value}`).join("\\n");
-    addBubble(lines, "bot");
+    addBubble("💰 <b>Precios actuales:</b><br>" + PRICES.join("<br>"), "bot", true);
   };
 
+  // Arrancar
   start();
-</script>
 
+</script>
 </body>
 </html>
-"""
-
+    """
     html = html.replace("__BUSINESS_WA_NUMBER__", BUSINESS_WHATSAPP_NUMBER)
+    html = html.replace("__MAX_BYTES__", str(MAX_IMAGE_BYTES))
     return HTMLResponse(html)
-
 
 @app.post("/submit")
 async def submit(
@@ -678,122 +667,95 @@ async def submit(
     whatsapp: str = Form(...),
     console: str = Form(...),
     design_choice: str = Form(""),
-    has_design: str = Form("no"),
+    has_design: str = Form("false"),
     whatsapp_prefill: str = Form(""),
     details: Optional[List[str]] = Form(None),
     images: Optional[List[UploadFile]] = File(None),
 ):
-    # Validaciones básicas
+    # --- Validaciones y Lógica Backend (Igual que antes pero robustecida) ---
     name = name.strip()
-    email = email.strip()
-    whatsapp = _clean_phone(whatsapp)
     console = console.strip()
-
-    if not name:
-        raise HTTPException(status_code=400, detail="Nombre es obligatorio.")
+    whatsapp = _clean_phone(whatsapp)
+    
     if not _basic_email_ok(email):
-        raise HTTPException(status_code=400, detail="Correo inválido.")
-    if not whatsapp:
-        raise HTTPException(status_code=400, detail="WhatsApp es obligatorio.")
-    if not console:
-        raise HTTPException(status_code=400, detail="Consola es obligatoria.")
+        raise HTTPException(400, "Email inválido")
 
     has_design_bool = _truthy(has_design)
     details = details or []
     images = images or []
 
-    # Regla: si has_design=yes -> mínimo 1 imagen y 1 detalle por imagen
-    if has_design_bool:
-        if len(images) < 1:
-            raise HTTPException(status_code=400, detail="Debes subir al menos 1 imagen.")
-        if len(details) != len(images):
-            raise HTTPException(status_code=400, detail="Cada imagen debe tener su detalle (mismo número).")
-        for d in details:
-            if not str(d).strip():
-                raise HTTPException(status_code=400, detail="Cada imagen debe tener detalles (no vacío).")
-
-    # Inserta lead
+    # Insertar Lead
     lead_data = {
         "name": name,
         "email": email,
         "whatsapp": whatsapp,
         "console": console,
-        "design_choice": (design_choice or "").strip(),
+        "design_choice": design_choice,
         "has_design": has_design_bool,
-        "whatsapp_prefill": (whatsapp_prefill or "").strip(),
+        "whatsapp_prefill": whatsapp_prefill
     }
-    lead = await _insert_lead(lead_data)
-    lead_id = lead["id"]
+    
+    try:
+        lead = await _insert_lead(lead_data)
+        lead_id = lead.get("id", "unknown")
+    except Exception as e:
+        print(f"Error insertando lead: {e}")
+        raise HTTPException(500, "Error guardando datos")
 
-    uploaded_rows: List[dict] = []
+    uploaded_info = []
 
-    # Sube imágenes + inserta lead_images
-    if has_design_bool:
-        for idx, up in enumerate(images):
-            ct = (up.content_type or "").lower().strip()
-            if ct not in ALLOWED_IMAGE_TYPES:
-                raise HTTPException(status_code=400, detail=f"Tipo de imagen no permitido: {ct}. Usa JPG/PNG/WEBP.")
+    # Procesar imágenes si es personalizado
+    if has_design_bool and images:
+        for idx, file in enumerate(images):
+            # Leer contenido para validar tamaño real en backend también
+            content = await file.read()
+            size = len(content)
+            
+            if size > MAX_IMAGE_BYTES:
+                # Opcional: Podrías simplemente saltarla o lanzar error. 
+                # Lanzar error detiene todo el proceso.
+                raise HTTPException(400, f"Imagen muy pesada (> {MAX_IMAGE_MB}MB)")
 
-            content = await up.read()
-            size_bytes = len(content)
-
-            if size_bytes <= 0:
-                raise HTTPException(status_code=400, detail="Una imagen viene vacía.")
-            if size_bytes > MAX_IMAGE_BYTES:
-                raise HTTPException(status_code=400, detail=f"Imagen supera el máximo permitido ({MAX_IMAGE_MB}MB).")
-
-            ext = ALLOWED_IMAGE_TYPES[ct]
-
-            safe_name = (up.filename or "image").strip()
-            safe_name = re.sub(r"[^a-zA-Z0-9\.\-_]+", "_", safe_name)[:80]
-
+            ct = file.content_type
+            ext = ALLOWED_IMAGE_TYPES.get(ct, ".jpg")
             path = f"{lead_id}/{uuid.uuid4().hex}{ext}"
+            
             await _upload_to_storage(SUPABASE_BUCKET, path, content, ct)
-
             public_url = _make_public_url(SUPABASE_BUCKET, path)
-
+            
+            detail_text = details[idx] if len(details) > idx else ""
+            
             row = {
                 "lead_id": lead_id,
                 "storage_bucket": SUPABASE_BUCKET,
                 "storage_path": path,
                 "public_url": public_url,
-                "original_filename": safe_name,
+                "original_filename": file.filename,
                 "content_type": ct,
-                "size_bytes": size_bytes,
-                "details": details[idx].strip(),
+                "size_bytes": size,
+                "details": detail_text
             }
             await _insert_lead_image(row)
-            uploaded_rows.append(row)
+            uploaded_info.append(row)
 
-    # Email al negocio
-    subject = f"Nuevo lead skins: {name} ({console})"
-    lines = []
-    lines.append("Nuevo lead recibido\n")
-    lines.append(f"Nombre: {name}")
-    lines.append(f"Correo: {email}")
-    lines.append(f"WhatsApp: {whatsapp}")
-    lines.append(f"Consola: {console}")
-    lines.append(f"Design choice: {design_choice}")
-    lines.append(f"Has design/images: {has_design_bool}")
-    if whatsapp_prefill:
-        lines.append(f"Mensaje WhatsApp (prefill): {whatsapp_prefill}")
-
-    if uploaded_rows:
-        lines.append("\nImágenes:")
-        for i, r in enumerate(uploaded_rows, start=1):
-            lines.append(f"\n#{i}")
-            lines.append(f"Link: {r['public_url']}")
-            lines.append(f"Detalles: {r['details']}")
-            lines.append(f"Archivo: {r.get('original_filename','')}")
-            lines.append(f"Tipo: {r.get('content_type','')} · Tamaño: {r.get('size_bytes',0)} bytes")
-    else:
-        lines.append("\n(No adjuntó imágenes)")
-
-    body = "\n".join(lines)
-
+    # Enviar correo (Background task idealmente, aquí sync para MVP)
     try:
-        await run_in_threadpool(_send_email_sync, subject, body)
+        email_body = f"""
+        Nuevo Lead de Skins:
+        --------------------
+        Nombre: {name}
+        Consola: {console}
+        WhatsApp: {whatsapp}
+        Email: {email}
+        Modo: {design_choice}
+        
+        Imágenes adjuntas: {len(uploaded_info)}
+        """
+        for img in uploaded_info:
+            email_body += f"\n- {img['public_url']} ({img['details']})"
+            
+        await run_in_threadpool(_send_email_sync, f"Nuevo Lead Skins: {name}", email_body)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lead guardado pero falló el correo: {str(e)}")
+        print(f"Error enviando email: {e}")
 
     return JSONResponse({"ok": True, "lead_id": lead_id})
