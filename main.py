@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import smtplib
+import html  # <--- IMPORTANTE: Para blindar contra inyección de código
 from email.message import EmailMessage
 from typing import List, Optional
 
@@ -26,12 +27,35 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
-# Asegúrate de que este número esté correcto (57 + número)
 BUSINESS_WHATSAPP_NUMBER = os.getenv("BUSINESS_WHATSAPP_NUMBER", "573183483807")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "5"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+# -----------------------------
+# SEGURIDAD Y LIMPIEZA
+# -----------------------------
+
+def sanitize_input(text: str) -> str:
+    """
+    BLINDAJE: 
+    1. Elimina espacios extra.
+    2. Convierte caracteres especiales HTML (&, <, >, ", ') en entidades seguras.
+       Ejemplo: <script> se convierte en &lt;script&gt; (ya no es ejecutable).
+    """
+    if not text:
+        return ""
+    text = text.strip()
+    return html.escape(text)
+
+def validate_phone(phone: str) -> str:
+    """
+    Solo permite números. Elimina cualquier intento de meter código.
+    """
+    # Elimina todo lo que NO sea número
+    clean_phone = re.sub(r"[^0-9]", "", phone)
+    return clean_phone
 
 # -----------------------------
 # Helpers & Database
@@ -42,7 +66,9 @@ def _sb_headers() -> dict:
     return {"apikey": SUPABASE_SERVICE_ROLE_KEY, "authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}
 
 def _basic_email_ok(email: str) -> bool:
-    return "@" in email and "." in email
+    # Regex más estricto para email
+    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+    return bool(re.match(pattern, email))
 
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in {"1", "true", "yes", "si", "sí", "y"}
@@ -94,6 +120,11 @@ def _send_email_sync(subject: str, body: str) -> None:
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
+    # ... (El HTML se mantiene igual, ya es seguro porque es estático) ...
+    # Para ahorrar espacio, mantengo el HTML anterior intacto aquí.
+    # Solo asegúrate de que el HTML sea el mismo que te pasé en la respuesta anterior.
+    # Aquí pego el HTML COMPLETO para que no tengas problemas al copiar y pegar.
+    
     html = """
 <!doctype html>
 <html lang="es">
@@ -469,21 +500,19 @@ def home():
       const bar = document.getElementById("inBarrio").value.trim();
       const addr = document.getElementById("inAddress").value.trim();
 
-      // VALIDACIONES RIGUROSAS
+      // VALIDACIONES EN JAVASCRIPT
       if (rec.length < 5 || !rec.includes(" ")) {
          return showError("Por favor escribe tu Nombre y Apellido completos.");
       }
-
-      // Valida email simple (texto@texto.texto)
+      
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       if (!emailRegex.test(email)) {
          return showError("El correo electrónico no es válido.");
       }
 
-      // Valida celular: solo números, min 7 dígitos
       const waClean = wa.replace(/[^0-9]/g, '');
       if (waClean.length < 7) {
-         return showError("El número de WhatsApp no es válido.");
+         return showError("El número de WhatsApp no es válido (mínimo 7 dígitos).");
       }
 
       if (!city || !bar || !addr) return showError("Falta ciudad, barrio o dirección.");
@@ -501,7 +530,7 @@ def home():
       fd.append("name", STATE.name);
       fd.append("receiver_name", STATE.receiver);
       fd.append("whatsapp", STATE.whatsapp);
-      fd.append("email", STATE.email); // Se envía al backend
+      fd.append("email", STATE.email);
       fd.append("city", STATE.city);
       fd.append("neighborhood", STATE.barrio);
       fd.append("address", STATE.address);
@@ -556,7 +585,7 @@ async def submit(
     name: str = Form(...),
     receiver_name: str = Form(""),
     whatsapp: str = Form(...),
-    email: str = Form(...), # Ahora es obligatorio
+    email: str = Form(...),
     city: str = Form(""),
     neighborhood: str = Form(""),
     address: str = Form(""),
@@ -566,6 +595,27 @@ async def submit(
     images: Optional[List[UploadFile]] = File(None),
     image_details: Optional[List[str]] = Form(None)
 ):
+    # BLINDAJE SERVER-SIDE
+    name = sanitize_input(name)
+    receiver_name = sanitize_input(receiver_name)
+    whatsapp = validate_phone(whatsapp)
+    email = sanitize_input(email)
+    city = sanitize_input(city)
+    neighborhood = sanitize_input(neighborhood)
+    address = sanitize_input(address)
+    console = sanitize_input(console)
+    design_choice = sanitize_input(design_choice)
+
+    # Validación Estricta Backend
+    if not _basic_email_ok(email):
+        raise HTTPException(400, "Formato de email inválido.")
+    
+    if len(whatsapp) < 7:
+        raise HTTPException(400, "Número de WhatsApp inválido.")
+
+    if len(receiver_name) < 5 or " " not in receiver_name:
+        raise HTTPException(400, "Nombre de quien recibe incompleto (Nombre + Apellido).")
+
     lead_data = {
         "name": name,
         "whatsapp": whatsapp,
@@ -590,6 +640,8 @@ async def submit(
             url = _make_public_url(SUPABASE_BUCKET, path)
             
             detail_text = image_details[i] if i < len(image_details) else "Sin detalle"
+            detail_text = sanitize_input(detail_text) # Blindaje también en detalles
+            
             img_report.append(f"- URL: {url}\n  Nota: {detail_text}")
             
             await _insert_lead_image({
@@ -603,7 +655,7 @@ async def submit(
             })
 
     email_body = f"""
-    NUEVO PEDIDO SKINS
+    NUEVO PEDIDO SKINS (BLINDADO)
     ==================
     Cliente: {name}
     Recibe: {receiver_name}
