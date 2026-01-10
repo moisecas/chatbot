@@ -243,7 +243,6 @@ def home():
         <option value="Xbox One X">Xbox One X</option>
         <option value="Xbox Series S">Xbox Series S</option>
         <option value="Xbox Series X">Xbox Series X</option>
-        <option value="Switch">Nintendo Switch</option>
       </select>
       <button class="btn" onclick="handleConsole()">Ver Diseños</button>
     `);
