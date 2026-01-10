@@ -60,13 +60,16 @@ def _make_public_url(bucket: str, path: str) -> str:
 # -----------------------------
 # Helpers DB
 # -----------------------------
-async def _get_gallery_images(category: str) -> List[dict]:
-    """Trae las imágenes de la tabla 'gallery' según categoría"""
+async def _get_gallery_images(console_model: str) -> List[dict]:
+    """
+    CAMBIO: Filtra por 'console_model' exacto (ej: 'PS4 Fat') 
+    para coincidir con la nueva estructura de la base de datos.
+    """
     url = f"{SUPABASE_URL}/rest/v1/gallery"
     params = {
         "select": "*",
-        "category": f"eq.{category}",
-        "order": "id.desc" # Las más nuevas primero
+        "console_model": f"eq.{console_model}", 
+        "order": "id.asc"
     }
     headers = _sb_headers()
     async with httpx.AsyncClient(timeout=10) as client:
@@ -113,13 +116,10 @@ def _send_email_sync(subject: str, body: str) -> None:
 # -----------------------------
 # API: Obtener Galería
 # -----------------------------
-@app.get("/api/gallery/{category}")
-async def get_gallery(category: str):
-    # Mapeo simple de seguridad
-    valid_cats = {"playstation", "xbox", "nintendo", "other"}
-    if category not in valid_cats:
-        return []
-    images = await _get_gallery_images(category)
+@app.get("/api/gallery/{console_type}")
+async def get_gallery(console_type: str):
+    # Recibimos el nombre exacto de la consola y consultamos
+    images = await _get_gallery_images(console_type)
     return images
 
 # -----------------------------
@@ -188,7 +188,7 @@ def home():
 <script>
   const BUSINESS_WA = "__BUSINESS_WA_NUMBER__";
   
-  // Combos fijos (estos rara vez cambian)
+  // Combos fijos
   const COMBOS = [
     { id: "c1", title: "Combo 1", price: 80000, desc: "2 controles + Arriba + Frontal + Abajo/Lados" },
     { id: "c2", title: "Combo 2", price: 65000, desc: "Arriba + Frontal + Abajo o Lados" },
@@ -198,7 +198,19 @@ def home():
     { id: "c7", title: "Combo 7 (Solo Series X)", price: 60000, desc: "4 Caras de la consola", only: ["Xbox Series X"] }
   ];
 
-  const STATE = { name: "", console: "", category: "", design_url: "", combo_id: "", extra_control: false, is_custom: false, base_price: 0, custom_uploads: [] };
+  // CAMBIO: Agregamos 'all_images' para guardar la galería en memoria
+  const STATE = { 
+    name: "", 
+    console: "", 
+    design_url: "", 
+    combo_id: "", 
+    extra_control: false, 
+    is_custom: false, 
+    base_price: 0, 
+    custom_uploads: [],
+    all_images: [] 
+  };
+  
   const msgs = document.getElementById("msgs");
   const controls = document.getElementById("controls");
 
@@ -243,6 +255,7 @@ def home():
         <option value="Xbox One X">Xbox One X</option>
         <option value="Xbox Series S">Xbox Series S</option>
         <option value="Xbox Series X">Xbox Series X</option>
+        <option value="Switch">Nintendo Switch</option>
       </select>
       <button class="btn" onclick="handleConsole()">Ver Diseños</button>
     `);
@@ -251,61 +264,85 @@ def home():
   window.handleConsole = () => {
     const c = document.getElementById("selConsole").value;
     if(!c) return showError("Selecciona una consola");
+    
+    // CAMBIO: Ya no usamos categoría genérica (xbox/play), usamos el nombre exacto
     STATE.console = c;
     
-    // Asignar categoría dinámica
-    if(c.includes("PS")) STATE.category = "playstation";
-    else if(c.includes("Xbox")) STATE.category = "xbox";
-    else if(c.includes("Switch")) STATE.category = "nintendo";
-    else STATE.category = "other";
-
     addBubble(c, "user");
-    fetchGallery(); // Llamamos al backend
+    fetchGallery(); 
   };
 
-  // 2. GALERÍAS (DINÁMICAS)
+  // 2. GALERÍAS
   async function fetchGallery() {
-    addBubble(`Buscando diseños para ${STATE.console}... ⏳`, "bot");
+    addBubble(`Buscando los mejores diseños para ${STATE.console}... ⏳`, "bot");
     setControls(`<div class="loader">Cargando...</div>`);
     
     try {
-        const res = await fetch(`/api/gallery/${STATE.category}`);
+        // CAMBIO: Enviamos el nombre exacto de la consola (con encodeURIComponent por los espacios)
+        const res = await fetch(`/api/gallery/${encodeURIComponent(STATE.console)}`);
         const images = await res.json();
         
         if(images.length === 0) {
             addBubble("Aún no tengo diseños cargados para esta consola en la galería.", "bot");
-            // Si no hay, mandamos directo a personalizado
             setControls(`<button class="btn secondary" onclick="startCustom()">🎨 Ir a Diseño Personalizado</button>`);
             return;
         }
 
-        renderGallery(images);
+        STATE.all_images = images;
+        renderBatch(1); // Renderizamos la primera tanda
+
     } catch(e) {
         addBubble("Hubo un error cargando la galería. Vamos a personalizado.", "bot");
         setControls(`<button class="btn" onclick="startCustom()">Personalizado</button>`);
     }
   }
 
-  function renderGallery(images) {
-    addBubble(`Mira estos diseños disponibles:`, "bot");
+  // CAMBIO: Función para renderizar por lotes de 10
+  function renderBatch(batchNumber) {
+    const limit = 10;
+    const start = (batchNumber - 1) * limit;
+    const end = start + limit;
+    
+    const slice = STATE.all_images.slice(start, end);
+    const hasMore = STATE.all_images.length > end;
+
+    // Mensaje AMIGABLE
+    let msg = "";
+    if(batchNumber === 1) msg = "¡Checa estos diseños brutales! 🔥";
+    else msg = "Aquí tienes más opciones exclusivas:";
+
+    addBubble(msg, "bot");
     
     let html = `<div class="grid">`;
-    images.forEach((img) => {
-      // img = { id, image_url, title, ... }
+    slice.forEach((img) => {
       html += `
         <div class="card" onclick="selectDesign(this, '${img.image_url}')">
             <img src="${img.image_url}" loading="lazy">
-            <div class="cap">${img.title || 'Diseño'}</div>
         </div>`;
     });
     html += `</div>`;
     
     addBubble(html, "bot", true);
     
-    setControls(`
-        <button class="btn secondary" onclick="startCustom()">🎨 Ninguno me convence, quiero personalizado</button>
-        <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp">💬 Contactar WhatsApp</a>
-    `);
+    let buttonsHtml = "";
+    
+    if (hasMore) {
+        // Si hay más: Botón "Ver más"
+        buttonsHtml = `
+            <div class="row">
+                <button class="btn secondary" onclick="renderBatch(${batchNumber + 1})">Ver más diseños</button>
+                <button class="btn secondary" onclick="startCustom()">Prefiero Personalizado</button>
+            </div>
+        `;
+    } else {
+        // Si es el final: Solo Personalizado y WA
+        buttonsHtml = `
+            <button class="btn secondary" onclick="startCustom()">🎨 Ninguno me convence, quiero personalizado</button>
+            <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp">💬 Contactar WhatsApp</a>
+        `;
+    }
+
+    setControls(buttonsHtml);
     addBubble("Toca una imagen para seleccionar.", "bot");
   }
 
@@ -516,81 +553,7 @@ def home():
 </script>
 </body>
 </html>
-    """
+"""
     html = html.replace("__BUSINESS_WA_NUMBER__", BUSINESS_WHATSAPP_NUMBER)
     return HTMLResponse(html)
-
-@app.post("/submit")
-async def submit(
-    name: str = Form(...),
-    receiver_name: str = Form(""),
-    whatsapp: str = Form(...),
-    email: str = Form(...),
-    city: str = Form(""),
-    neighborhood: str = Form(""),
-    address: str = Form(""),
-    console: str = Form(...),
-    design_choice: str = Form(""),
-    has_design: str = Form("false"),
-    images: Optional[List[UploadFile]] = File(None),
-    image_details: Optional[List[str]] = Form(None)
-):
-    name = sanitize_input(name)
-    receiver_name = sanitize_input(receiver_name)
-    whatsapp = validate_phone(whatsapp)
-    email = sanitize_input(email)
-    city = sanitize_input(city)
-    neighborhood = sanitize_input(neighborhood)
-    address = sanitize_input(address)
-    console = sanitize_input(console)
-    design_choice = sanitize_input(design_choice)
-
-    if not _basic_email_ok(email): raise HTTPException(400, "Email inválido")
-    if len(whatsapp) < 7: raise HTTPException(400, "WhatsApp inválido")
-    if len(receiver_name) < 5 or " " not in receiver_name: raise HTTPException(400, "Nombre incompleto")
-
-    lead_data = {
-        "name": name, "whatsapp": whatsapp, "console": console,
-        "email": email, "design_choice": design_choice
-    }
-    lead = await _insert_lead(lead_data)
-    lead_id = lead.get("id", "temp")
-
-    img_report = []
-    if not image_details: image_details = []
-
-    if _truthy(has_design) and images:
-        for i, file in enumerate(images):
-            content = await file.read()
-            if len(content) > MAX_IMAGE_BYTES: continue
-            
-            path = f"{lead_id}/{uuid.uuid4().hex}_{file.filename}"
-            await _upload_to_storage(SUPABASE_BUCKET, path, content, file.content_type)
-            url = _make_public_url(SUPABASE_BUCKET, path)
-            
-            detail_text = sanitize_input(image_details[i] if i < len(image_details) else "Sin detalle")
-            img_report.append(f"- URL: {url}\n  Nota: {detail_text}")
-            
-            await _insert_lead_image({
-                "lead_id": lead_id, "storage_bucket": SUPABASE_BUCKET, "storage_path": path,
-                "public_url": url, "original_filename": file.filename, "size_bytes": len(content), "details": detail_text 
-            })
-
-    email_body = f"""
-    NUEVO PEDIDO SKINS
-    ==================
-    Cliente: {name}
-    Recibe: {receiver_name}
-    WhatsApp: {whatsapp}
-    Email: {email}
     
-    ENVÍO: {city}, {neighborhood}, {address}
-    PEDIDO: {console}
-    Detalle: {design_choice}
-    """
-    if img_report: email_body += "\n\nIMÁGENES (" + str(len(img_report)) + "):\n" + "\n".join(img_report)
-    
-    try: await run_in_threadpool(_send_email_sync, f"Pedido Skins: {name} ({city})", email_body)
-    except: pass
-
-    return JSONResponse({"ok": True})
