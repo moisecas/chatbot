@@ -2,7 +2,7 @@ import os
 import re
 import uuid
 import smtplib
-import html  # <--- IMPORTANTE: Para blindar contra inyección de código
+import html
 from email.message import EmailMessage
 from typing import List, Optional
 
@@ -34,41 +34,22 @@ MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
 # -----------------------------
-# SEGURIDAD Y LIMPIEZA
+# Funciones de Seguridad
 # -----------------------------
-
 def sanitize_input(text: str) -> str:
-    """
-    BLINDAJE: 
-    1. Elimina espacios extra.
-    2. Convierte caracteres especiales HTML (&, <, >, ", ') en entidades seguras.
-       Ejemplo: <script> se convierte en &lt;script&gt; (ya no es ejecutable).
-    """
-    if not text:
-        return ""
-    text = text.strip()
-    return html.escape(text)
+    if not text: return ""
+    return html.escape(text.strip())
 
 def validate_phone(phone: str) -> str:
-    """
-    Solo permite números. Elimina cualquier intento de meter código.
-    """
-    # Elimina todo lo que NO sea número
-    clean_phone = re.sub(r"[^0-9]", "", phone)
-    return clean_phone
+    return re.sub(r"[^0-9]", "", phone)
 
-# -----------------------------
-# Helpers & Database
-# -----------------------------
 def _sb_headers() -> dict:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Faltan credenciales de Supabase.")
     return {"apikey": SUPABASE_SERVICE_ROLE_KEY, "authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}
 
 def _basic_email_ok(email: str) -> bool:
-    # Regex más estricto para email
-    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
-    return bool(re.match(pattern, email))
+    return bool(re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", email))
 
 def _truthy(s: str) -> bool:
     return str(s).strip().lower() in {"1", "true", "yes", "si", "sí", "y"}
@@ -76,17 +57,31 @@ def _truthy(s: str) -> bool:
 def _make_public_url(bucket: str, path: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
 
+# -----------------------------
+# Helpers DB
+# -----------------------------
+async def _get_gallery_images(category: str) -> List[dict]:
+    """Trae las imágenes de la tabla 'gallery' según categoría"""
+    url = f"{SUPABASE_URL}/rest/v1/gallery"
+    params = {
+        "select": "*",
+        "category": f"eq.{category}",
+        "order": "id.desc" # Las más nuevas primero
+    }
+    headers = _sb_headers()
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=headers, params=params)
+        if r.status_code == 200:
+            return r.json()
+        return []
+
 async def _insert_lead(data: dict) -> dict:
     url = f"{SUPABASE_URL}/rest/v1/leads"
     headers = _sb_headers()
     headers["prefer"] = "return=representation"
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json=[data])
-        if r.status_code >= 300:
-            print(f"Warning DB: {r.text}")
-            return {}
-        rows = r.json()
-        return rows[0] if rows else {}
+        return r.json()[0] if r.status_code < 300 and r.json() else {}
 
 async def _insert_lead_image(row: dict) -> None:
     url = f"{SUPABASE_URL}/rest/v1/lead_images"
@@ -116,15 +111,22 @@ def _send_email_sync(subject: str, body: str) -> None:
         server.send_message(msg)
 
 # -----------------------------
-# Routes
+# API: Obtener Galería
+# -----------------------------
+@app.get("/api/gallery/{category}")
+async def get_gallery(category: str):
+    # Mapeo simple de seguridad
+    valid_cats = {"playstation", "xbox", "nintendo", "other"}
+    if category not in valid_cats:
+        return []
+    images = await _get_gallery_images(category)
+    return images
+
+# -----------------------------
+# Frontend
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # ... (El HTML se mantiene igual, ya es seguro porque es estático) ...
-    # Para ahorrar espacio, mantengo el HTML anterior intacto aquí.
-    # Solo asegúrate de que el HTML sea el mismo que te pasé en la respuesta anterior.
-    # Aquí pego el HTML COMPLETO para que no tengas problemas al copiar y pegar.
-    
     html = """
 <!doctype html>
 <html lang="es">
@@ -134,85 +136,43 @@ def home():
   <title>Skins Colombia - Pedidos</title>
   <style>
     :root {
-      --bg: #0b1220;
-      --bubble-bot: #1e293b; 
-      --bubble-user: #2563eb;
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-      --accent: #3b82f6;
-      --ok: #22c55e;
-      --input-bg: #f8fafc;
-      --input-text: #0f172a;
-      --danger: #ef4444;
+      --bg: #0b1220; --bubble-bot: #1e293b; --bubble-user: #2563eb;
+      --text: #f1f5f9; --muted: #94a3b8; --accent: #3b82f6; --ok: #22c55e;
+      --input-bg: #f8fafc; --input-text: #0f172a; --danger: #ef4444;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0; font-family: system-ui, -apple-system, sans-serif;
-      background: var(--bg); color: var(--text);
-      height: 100vh; display: flex; flex-direction: column;
+      background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column;
     }
-    .wrap {
-      max-width: 600px; margin: 0 auto; width: 100%; height: 100%;
-      display: flex; flex-direction: column;
-    }
-    header {
-      padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.1);
-      background: rgba(15,27,51,0.95); display: flex; justify-content: space-between; align-items: center;
-    }
-    .chat {
-      flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px;
-      scroll-behavior: smooth;
-    }
-    .bubble {
-      max-width: 85%; padding: 12px 14px; border-radius: 16px;
-      line-height: 1.4; font-size: 15px; animation: popIn 0.3s ease-out;
-    }
+    .wrap { max-width: 600px; margin: 0 auto; width: 100%; height: 100%; display: flex; flex-direction: column; }
+    header { padding: 12px 16px; background: rgba(15,27,51,0.95); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.1); }
+    .chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; scroll-behavior: smooth; }
+    .bubble { max-width: 85%; padding: 12px 14px; border-radius: 16px; line-height: 1.4; font-size: 15px; animation: popIn 0.3s ease-out; }
     .bot { background: var(--bubble-bot); border-bottom-left-radius: 4px; color: #e2e8f0; }
     .user { background: var(--bubble-user); margin-left: auto; border-bottom-right-radius: 4px; color: white; }
     @keyframes popIn { from{opacity:0; transform:translateY(5px);} to{opacity:1; transform:translateY(0);} }
-
-    .controls {
-      padding: 12px 16px; background: #111827; border-top: 1px solid rgba(255,255,255,0.1);
-    }
-    
-    input, select, textarea {
-      width: 100%; padding: 12px; border-radius: 10px; border: none;
-      background: var(--input-bg); color: var(--input-text); font-size: 16px; outline: none; margin-bottom: 8px;
-    }
+    .controls { padding: 12px 16px; background: #111827; border-top: 1px solid rgba(255,255,255,0.1); }
+    input, select, textarea { width: 100%; padding: 12px; border-radius: 10px; border: none; background: var(--input-bg); color: var(--input-text); font-size: 16px; outline: none; margin-bottom: 8px; }
     textarea { min-height: 60px; resize: vertical; }
-
-    .btn {
-      width: 100%; border: none; border-radius: 10px; padding: 12px;
-      background: var(--accent); color: white; font-weight: 600; cursor: pointer; text-align: center; margin-top: 4px; display:block;
-    }
+    .btn { width: 100%; border: none; border-radius: 10px; padding: 12px; background: var(--accent); color: white; font-weight: 600; cursor: pointer; text-align: center; margin-top: 4px; display:block; }
     .btn.secondary { background: #334155; }
     .btn.whatsapp { background: #25D366; }
     .btn.ok { background: var(--ok); color: #000; }
     .btn.add { background: transparent; border: 1px dashed var(--muted); color: var(--muted); margin-bottom:10px; }
-    
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
-    .card {
-      border-radius: 8px; overflow: hidden; background: #000; position: relative; border: 2px solid transparent; cursor: pointer;
-    }
+    .card { border-radius: 8px; overflow: hidden; background: #000; position: relative; border: 2px solid transparent; cursor: pointer; }
     .card.selected { border-color: var(--ok); }
     .card img { width: 100%; height: 110px; object-fit: cover; display: block; }
     .card .cap { font-size: 10px; padding: 4px; text-align: center; color: #ccc; }
-
-    .combo-card {
-      background: #1e293b; border: 1px solid #334155; border-radius: 10px;
-      padding: 12px; margin-bottom: 8px; cursor: pointer;
-    }
+    .combo-card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
     .combo-card.active { border-color: var(--ok); background: rgba(34, 197, 94, 0.1); }
-    
-    .upload-row {
-      background: rgba(255,255,255,0.05); padding: 10px; border-radius: 10px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.1);
-    }
+    .upload-row { background: rgba(255,255,255,0.05); padding: 10px; border-radius: 10px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.1); }
     .upload-row label { display: block; font-size: 12px; color: var(--accent); margin-bottom: 4px; font-weight: bold; }
-    
     .check-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 8px; }
     .check-row input { width: auto; margin: 0; }
-    
     .tiny { font-size: 12px; color: var(--muted); }
+    .loader { text-align:center; padding: 20px; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -226,25 +186,9 @@ def home():
 </div>
 
 <script>
-  // CONFIG
   const BUSINESS_WA = "__BUSINESS_WA_NUMBER__";
   
-  // Data Placeholders
-  const DESIGN_BATCH_1 = [
-    "https://images.unsplash.com/photo-1534423861386-85a16f5d13fd?w=300", "https://images.unsplash.com/photo-1511512578047-dfb367046420?w=300",
-    "https://images.unsplash.com/photo-1542751371-adc38448a05e?w=300", "https://images.unsplash.com/photo-1593118247619-e2d6f056869e?w=300",
-    "https://images.unsplash.com/photo-1612287230202-1ff1d85d1bdf?w=300", "https://images.unsplash.com/photo-1560253023-3ec5d502959f?w=300",
-    "https://images.unsplash.com/photo-1626379953822-baec19c3accd?w=300", "https://images.unsplash.com/photo-1579373903781-fd5c0c30c4cd?w=300",
-    "https://images.unsplash.com/photo-1616588589676-60b30c3c1681?w=300", "https://images.unsplash.com/photo-1605901309584-818e25960b8f?w=300"
-  ];
-  const DESIGN_BATCH_2 = [
-    "https://images.unsplash.com/photo-1600080972464-8cb882e6a9f0?w=300", "https://images.unsplash.com/photo-1552820728-8b83bb6b773f?w=300",
-    "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=300", "https://images.unsplash.com/photo-1493711662062-fa541adb3fc8?w=300",
-    "https://images.unsplash.com/photo-1513542789411-b6a5d4f31634?w=300", "https://images.unsplash.com/photo-1605810230434-7631ac76ec81?w=300",
-    "https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=300", "https://images.unsplash.com/photo-1531297461136-82lw9f23?w=300",
-    "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=300", "https://images.unsplash.com/photo-1592155931584-901ac15763e3?w=300"
-  ];
-
+  // Combos fijos (estos rara vez cambian)
   const COMBOS = [
     { id: "c1", title: "Combo 1", price: 80000, desc: "2 controles + Arriba + Frontal + Abajo/Lados" },
     { id: "c2", title: "Combo 2", price: 65000, desc: "Arriba + Frontal + Abajo o Lados" },
@@ -254,11 +198,7 @@ def home():
     { id: "c7", title: "Combo 7 (Solo Series X)", price: 60000, desc: "4 Caras de la consola", only: ["Xbox Series X"] }
   ];
 
-  const STATE = { 
-    name: "", console: "", design_url: "", combo_id: "", extra_control: false, is_custom: false, base_price: 0,
-    custom_uploads: []
-  };
-  
+  const STATE = { name: "", console: "", category: "", design_url: "", combo_id: "", extra_control: false, is_custom: false, base_price: 0, custom_uploads: [] };
   const msgs = document.getElementById("msgs");
   const controls = document.getElementById("controls");
 
@@ -299,8 +239,11 @@ def home():
         <option value="PS5 Fat">PS5 Fat</option>
         <option value="PS5 Slim">PS5 Slim</option>
         <option value="Xbox One">Xbox One</option>
+        <option value="Xbox One S">Xbox One S</option>
+        <option value="Xbox One X">Xbox One X</option>
         <option value="Xbox Series S">Xbox Series S</option>
         <option value="Xbox Series X">Xbox Series X</option>
+        <option value="Switch">Nintendo Switch</option>
       </select>
       <button class="btn" onclick="handleConsole()">Ver Diseños</button>
     `);
@@ -310,32 +253,62 @@ def home():
     const c = document.getElementById("selConsole").value;
     if(!c) return showError("Selecciona una consola");
     STATE.console = c;
+    
+    // Asignar categoría dinámica
+    if(c.includes("PS")) STATE.category = "playstation";
+    else if(c.includes("Xbox")) STATE.category = "xbox";
+    else if(c.includes("Switch")) STATE.category = "nintendo";
+    else STATE.category = "other";
+
     addBubble(c, "user");
-    showGallery(1);
+    fetchGallery(); // Llamamos al backend
   };
 
-  // 2. GALERÍAS
-  window.showGallery = (batch) => {
-    const imgs = batch === 1 ? DESIGN_BATCH_1 : DESIGN_BATCH_2;
-    addBubble(batch === 1 ? "Tanda 1 de diseños:" : "Tanda 2 de diseños:");
+  // 2. GALERÍAS (DINÁMICAS)
+  async function fetchGallery() {
+    addBubble(`Buscando diseños para ${STATE.console}... ⏳`, "bot");
+    setControls(`<div class="loader">Cargando...</div>`);
+    
+    try {
+        const res = await fetch(`/api/gallery/${STATE.category}`);
+        const images = await res.json();
+        
+        if(images.length === 0) {
+            addBubble("Aún no tengo diseños cargados para esta consola en la galería.", "bot");
+            // Si no hay, mandamos directo a personalizado
+            setControls(`<button class="btn secondary" onclick="startCustom()">🎨 Ir a Diseño Personalizado</button>`);
+            return;
+        }
+
+        renderGallery(images);
+    } catch(e) {
+        addBubble("Hubo un error cargando la galería. Vamos a personalizado.", "bot");
+        setControls(`<button class="btn" onclick="startCustom()">Personalizado</button>`);
+    }
+  }
+
+  function renderGallery(images) {
+    addBubble(`Mira estos diseños disponibles:`, "bot");
     
     let html = `<div class="grid">`;
-    imgs.forEach((u, i) => {
-      html += `<div class="card" onclick="selectDesign(this, '${u}')"><img src="${u}" loading="lazy"><div class="cap">Diseño ${(batch-1)*10 + i + 1}</div></div>`;
+    images.forEach((img) => {
+      // img = { id, image_url, title, ... }
+      html += `
+        <div class="card" onclick="selectDesign(this, '${img.image_url}')">
+            <img src="${img.image_url}" loading="lazy">
+            <div class="cap">${img.title || 'Diseño'}</div>
+        </div>`;
     });
     html += `</div>`;
+    
     addBubble(html, "bot", true);
-
-    if (batch === 1) {
-      setControls(`<button class="btn secondary" onclick="showGallery(2)">Ver más diseños</button>`);
-    } else {
-      setControls(`
-        <button class="btn secondary" onclick="startCustom()">🎨 Quiero Personalizado</button>
+    
+    setControls(`
+        <button class="btn secondary" onclick="startCustom()">🎨 Ninguno me convence, quiero personalizado</button>
         <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp">💬 Contactar WhatsApp</a>
-      `);
-    }
-    addBubble("Toca una imagen para ver los precios.", "bot");
-  };
+    `);
+    addBubble("Toca una imagen para seleccionar.", "bot");
+  }
 
   window.selectDesign = (el, url) => {
     document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
@@ -401,17 +374,14 @@ def home():
       window.open(`https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(msg)}`, '_blank');
   };
 
-  // 4. DATOS DE ENVÍO + CARGA
+  // 4. DATOS Y CARGA
   window.askShippingData = () => {
     const t = (STATE.base_price || 0) + (STATE.extra_control ? 16000 : 0);
     const combo = COMBOS.find(c => c.id === STATE.combo_id);
     addBubble(`Elegí: ${combo.title}. Total: $${t.toLocaleString()}`, "user");
     
-    if (STATE.is_custom) {
-        renderCustomUploadForm(combo);
-    } else {
-        renderShippingForm();
-    }
+    if (STATE.is_custom) renderCustomUploadForm(combo);
+    else renderShippingForm();
   };
 
   function renderCustomUploadForm(combo) {
@@ -444,21 +414,15 @@ def home():
       const rows = document.querySelectorAll(".upload-row");
       const uploads = [];
       let hasFile = false;
-
       rows.forEach(row => {
           const fileIn = row.querySelector(".file-in");
           const descIn = row.querySelector(".desc-in");
           if(fileIn.files.length > 0) {
               hasFile = true;
-              uploads.push({
-                  file: fileIn.files[0],
-                  detail: descIn.value.trim() || "Sin detalles específicos"
-              });
+              uploads.push({ file: fileIn.files[0], detail: descIn.value.trim() || "Sin detalles" });
           }
       });
-
       if (!hasFile) return showError("Sube al menos una imagen para continuar.");
-      
       STATE.custom_uploads = uploads;
       addBubble(`✅ He adjuntado ${uploads.length} imágenes.`, "user");
       renderShippingForm();
@@ -466,27 +430,20 @@ def home():
 
   function renderShippingForm() {
       addBubble("Para el envío gratis y pago contra entrega, necesito tus datos:", "bot");
-      
       setControls(`
         <div style="background:#1e293b; padding:10px; border-radius:10px;">
             <label class="tiny">Nombre completo de quien recibe (Nombre + Apellido):</label>
             <input id="inReceiver" value="${STATE.name}" placeholder="Ej: Juan Pérez">
-            
             <label class="tiny">WhatsApp:</label>
             <input id="inWa" type="tel" placeholder="300 123 4567">
-            
             <label class="tiny">Correo Electrónico:</label>
             <input id="inEmail" type="email" placeholder="ejemplo@correo.com">
-            
             <label class="tiny">Ciudad:</label>
             <input id="inCity" placeholder="Ej: Bogotá">
-            
             <label class="tiny">Barrio:</label>
             <input id="inBarrio" placeholder="Ej: Chapinero">
-            
             <label class="tiny">Dirección Exacta:</label>
             <input id="inAddress" placeholder="Cl 123 # 45-67 Apto 101">
-            
             <button class="btn ok" onclick="submitFinal()">✅ FINALIZAR PEDIDO</button>
         </div>
       `);
@@ -500,29 +457,14 @@ def home():
       const bar = document.getElementById("inBarrio").value.trim();
       const addr = document.getElementById("inAddress").value.trim();
 
-      // VALIDACIONES EN JAVASCRIPT
-      if (rec.length < 5 || !rec.includes(" ")) {
-         return showError("Por favor escribe tu Nombre y Apellido completos.");
-      }
-      
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
-         return showError("El correo electrónico no es válido.");
-      }
-
+      if (rec.length < 5 || !rec.includes(" ")) return showError("Nombre y Apellido requeridos.");
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return showError("Correo inválido.");
       const waClean = wa.replace(/[^0-9]/g, '');
-      if (waClean.length < 7) {
-         return showError("El número de WhatsApp no es válido (mínimo 7 dígitos).");
-      }
-
+      if (waClean.length < 7) return showError("Número de WhatsApp inválido.");
       if (!city || !bar || !addr) return showError("Falta ciudad, barrio o dirección.");
 
-      STATE.receiver = rec;
-      STATE.whatsapp = wa;
-      STATE.email = email;
-      STATE.city = city;
-      STATE.barrio = bar;
-      STATE.address = addr;
+      STATE.receiver = rec; STATE.whatsapp = wa; STATE.email = email;
+      STATE.city = city; STATE.barrio = bar; STATE.address = addr;
 
       addBubble("Enviando pedido... ⏳", "bot");
       
@@ -558,15 +500,14 @@ def home():
           
           if (STATE.is_custom) {
              addBubble("✅ ¡Pedido Personalizado Recibido!", "bot");
-             addBubble("Te enviaremos la propuesta de diseño por WhatsApp y Correo en un plazo máximo de 3 días.", "bot");
+             addBubble("Te enviaremos la propuesta de diseño por WhatsApp/Correo en máx 3 días.", "bot");
           } else {
              addBubble("✅ ¡Pedido Confirmado!", "bot");
-             addBubble("Te contactaremos al WhatsApp para coordinar el despacho.", "bot");
+             addBubble("Te contactaremos al WhatsApp para el despacho.", "bot");
           }
           
           const waText = `Hola, hice un pedido de ${combo.title} por $${t}. A nombre de ${STATE.receiver} en ${STATE.city}.`;
           setControls(`<a href="https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(waText)}" class="btn whatsapp">Abrir WhatsApp</a>`);
-          
       } catch (e) {
           addBubble("Error conectando. Envíanos los datos por WhatsApp.", "bot");
       }
@@ -595,7 +536,6 @@ async def submit(
     images: Optional[List[UploadFile]] = File(None),
     image_details: Optional[List[str]] = Form(None)
 ):
-    # BLINDAJE SERVER-SIDE
     name = sanitize_input(name)
     receiver_name = sanitize_input(receiver_name)
     whatsapp = validate_phone(whatsapp)
@@ -606,24 +546,14 @@ async def submit(
     console = sanitize_input(console)
     design_choice = sanitize_input(design_choice)
 
-    # Validación Estricta Backend
-    if not _basic_email_ok(email):
-        raise HTTPException(400, "Formato de email inválido.")
-    
-    if len(whatsapp) < 7:
-        raise HTTPException(400, "Número de WhatsApp inválido.")
-
-    if len(receiver_name) < 5 or " " not in receiver_name:
-        raise HTTPException(400, "Nombre de quien recibe incompleto (Nombre + Apellido).")
+    if not _basic_email_ok(email): raise HTTPException(400, "Email inválido")
+    if len(whatsapp) < 7: raise HTTPException(400, "WhatsApp inválido")
+    if len(receiver_name) < 5 or " " not in receiver_name: raise HTTPException(400, "Nombre incompleto")
 
     lead_data = {
-        "name": name,
-        "whatsapp": whatsapp,
-        "console": console,
-        "email": email,
-        "design_choice": design_choice
+        "name": name, "whatsapp": whatsapp, "console": console,
+        "email": email, "design_choice": design_choice
     }
-    
     lead = await _insert_lead(lead_data)
     lead_id = lead.get("id", "temp")
 
@@ -639,46 +569,29 @@ async def submit(
             await _upload_to_storage(SUPABASE_BUCKET, path, content, file.content_type)
             url = _make_public_url(SUPABASE_BUCKET, path)
             
-            detail_text = image_details[i] if i < len(image_details) else "Sin detalle"
-            detail_text = sanitize_input(detail_text) # Blindaje también en detalles
-            
+            detail_text = sanitize_input(image_details[i] if i < len(image_details) else "Sin detalle")
             img_report.append(f"- URL: {url}\n  Nota: {detail_text}")
             
             await _insert_lead_image({
-                "lead_id": lead_id,
-                "storage_bucket": SUPABASE_BUCKET,
-                "storage_path": path,
-                "public_url": url,
-                "original_filename": file.filename,
-                "size_bytes": len(content),
-                "details": detail_text 
+                "lead_id": lead_id, "storage_bucket": SUPABASE_BUCKET, "storage_path": path,
+                "public_url": url, "original_filename": file.filename, "size_bytes": len(content), "details": detail_text 
             })
 
     email_body = f"""
-    NUEVO PEDIDO SKINS (BLINDADO)
+    NUEVO PEDIDO SKINS
     ==================
     Cliente: {name}
     Recibe: {receiver_name}
     WhatsApp: {whatsapp}
     Email: {email}
     
-    DATOS DE ENVÍO:
-    ---------------
-    Ciudad: {city}
-    Barrio: {neighborhood}
-    Dirección: {address}
-    
-    PEDIDO:
-    -------
-    Consola: {console}
+    ENVÍO: {city}, {neighborhood}, {address}
+    PEDIDO: {console}
     Detalle: {design_choice}
     """
+    if img_report: email_body += "\n\nIMÁGENES (" + str(len(img_report)) + "):\n" + "\n".join(img_report)
     
-    if img_report:
-        email_body += "\n\nIMÁGENES ADJUNTAS (" + str(len(img_report)) + "):\n" + "\n".join(img_report)
-    
-    try:
-        await run_in_threadpool(_send_email_sync, f"Pedido Skins: {name} ({city})", email_body)
+    try: await run_in_threadpool(_send_email_sync, f"Pedido Skins: {name} ({city})", email_body)
     except: pass
 
     return JSONResponse({"ok": True})
