@@ -61,10 +61,6 @@ def _make_public_url(bucket: str, path: str) -> str:
 # Helpers DB
 # -----------------------------
 async def _get_gallery_images(console_model: str) -> List[dict]:
-    """
-    CAMBIO: Filtra por 'console_model' exacto (ej: 'PS4 Fat') 
-    para coincidir con la nueva estructura de la base de datos.
-    """
     url = f"{SUPABASE_URL}/rest/v1/gallery"
     params = {
         "select": "*",
@@ -102,32 +98,137 @@ async def _upload_to_storage(bucket: str, path: str, content: bytes, content_typ
         await client.post(url, headers=headers, content=content)
 
 def _send_email_sync(subject: str, body: str) -> None:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD): return
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD): 
+        print("⚠️ No hay credenciales SMTP configuradas. No se envió el correo.")
+        return
+    
     msg = EmailMessage()
     msg["From"] = SMTP_FROM
     msg["To"] = BUSINESS_EMAIL_TO
     msg["Subject"] = subject
     msg.set_content(body)
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
+    
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        print("✅ Correo enviado correctamente.")
+    except Exception as e:
+        print(f"❌ Error enviando correo: {e}")
 
 # -----------------------------
 # API: Obtener Galería
 # -----------------------------
 @app.get("/api/gallery/{console_type}")
 async def get_gallery(console_type: str):
-    # Recibimos el nombre exacto de la consola y consultamos
     images = await _get_gallery_images(console_type)
     return images
+
+# -----------------------------
+# API: Recibir Pedido (NUEVO)
+# -----------------------------
+@app.post("/submit")
+async def submit_lead(
+    name: str = Form(...),
+    receiver_name: str = Form(...),
+    whatsapp: str = Form(...),
+    email: str = Form(...),
+    city: str = Form(...),
+    neighborhood: str = Form(...),
+    address: str = Form(...),
+    console: str = Form(...),
+    design_choice: str = Form(...),
+    has_design: str = Form(...),
+    images: List[UploadFile] = File(None),
+    image_details: List[str] = Form(None)
+):
+    print(f"📥 Nuevo pedido recibido de: {name}")
+
+    # 1. Preparar datos para Supabase
+    lead_data = {
+        "name": name,
+        "receiver_name": receiver_name,
+        "whatsapp": validate_phone(whatsapp),
+        "email": email,
+        "city": city,
+        "neighborhood": neighborhood,
+        "address": address,
+        "console": console,
+        "design_choice": design_choice,
+        "has_design": _truthy(has_design)
+    }
+
+    # 2. Guardar Lead en DB
+    new_lead = await _insert_lead(lead_data)
+    if not new_lead:
+        return JSONResponse(status_code=500, content={"error": "Error guardando en base de datos"})
+
+    lead_id = new_lead.get("id")
+    
+    # 3. Procesar Imágenes
+    image_links_html = ""
+    if _truthy(has_design) and images:
+        details_list = image_details if image_details else []
+        
+        for i, file_obj in enumerate(images):
+            if not file_obj.filename: continue
+            
+            ext = ALLOWED_IMAGE_TYPES.get(file_obj.content_type)
+            if not ext: continue
+
+            content = await file_obj.read()
+            if len(content) > MAX_IMAGE_BYTES: continue
+
+            # Subir a Supabase Storage: leads/{id}/{uuid}.jpg
+            filename = f"{uuid.uuid4()}{ext}"
+            path = f"leads/{lead_id}/{filename}"
+            
+            try:
+                await _upload_to_storage(SUPABASE_BUCKET, path, content, file_obj.content_type)
+                public_url = _make_public_url(SUPABASE_BUCKET, path)
+                
+                detail_text = details_list[i] if i < len(details_list) else "Sin detalle"
+                await _insert_lead_image({
+                    "lead_id": lead_id,
+                    "image_url": public_url,
+                    "detail": detail_text
+                })
+                image_links_html += f"\n- {detail_text}: {public_url}"
+            except Exception as e:
+                print(f"Error subiendo imagen: {e}")
+
+    # 4. Enviar Correo
+    email_body = f"""
+    NUEVO PEDIDO - SKINS COLOMBIA
+    -----------------------------
+    Cliente: {receiver_name} ({name})
+    WhatsApp: {whatsapp}
+    Ciudad: {city}
+    Barrio: {neighborhood}
+    Dirección: {address}
+    
+    PEDIDO:
+    Consola: {console}
+    Detalle: {design_choice}
+    
+    IMÁGENES ADJUNTAS:
+    -----------------------------
+    {image_links_html if image_links_html else "No adjuntó imágenes nuevas (Eligió de galería)."}
+    """
+    
+    # Ejecutar envio de email en background
+    subject = f"Pedido #{lead_id} - {console} - {receiver_name}"
+    await run_in_threadpool(_send_email_sync, subject, email_body)
+
+    return {"status": "ok", "lead_id": lead_id}
 
 # -----------------------------
 # Frontend
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    html = """
+    html_content = """
 <!doctype html>
 <html lang="es">
 <head>
@@ -164,7 +265,6 @@ def home():
     .card { border-radius: 8px; overflow: hidden; background: #000; position: relative; border: 2px solid transparent; cursor: pointer; }
     .card.selected { border-color: var(--ok); }
     .card img { width: 100%; height: 110px; object-fit: cover; display: block; }
-    .card .cap { font-size: 10px; padding: 4px; text-align: center; color: #ccc; }
     .combo-card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
     .combo-card.active { border-color: var(--ok); background: rgba(34, 197, 94, 0.1); }
     .upload-row { background: rgba(255,255,255,0.05); padding: 10px; border-radius: 10px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.1); }
@@ -188,7 +288,6 @@ def home():
 <script>
   const BUSINESS_WA = "__BUSINESS_WA_NUMBER__";
   
-  // Combos fijos
   const COMBOS = [
     { id: "c1", title: "Combo 1", price: 80000, desc: "2 controles + Arriba + Frontal + Abajo/Lados" },
     { id: "c2", title: "Combo 2", price: 65000, desc: "Arriba + Frontal + Abajo o Lados" },
@@ -198,17 +297,10 @@ def home():
     { id: "c7", title: "Combo 7 (Solo Series X)", price: 60000, desc: "4 Caras de la consola", only: ["Xbox Series X"] }
   ];
 
-  // CAMBIO: Agregamos 'all_images' para guardar la galería en memoria
   const STATE = { 
-    name: "", 
-    console: "", 
-    design_url: "", 
-    combo_id: "", 
-    extra_control: false, 
-    is_custom: false, 
-    base_price: 0, 
-    custom_uploads: [],
-    all_images: [] 
+    name: "", console: "", design_url: "", combo_id: "", 
+    extra_control: false, is_custom: false, base_price: 0, 
+    custom_uploads: [], all_images: [] 
   };
   
   const msgs = document.getElementById("msgs");
@@ -264,21 +356,17 @@ def home():
   window.handleConsole = () => {
     const c = document.getElementById("selConsole").value;
     if(!c) return showError("Selecciona una consola");
-    
-    // CAMBIO: Ya no usamos categoría genérica (xbox/play), usamos el nombre exacto
     STATE.console = c;
-    
     addBubble(c, "user");
     fetchGallery(); 
   };
 
-  // 2. GALERÍAS
+  // 2. GALERÍA
   async function fetchGallery() {
     addBubble(`Buscando los mejores diseños para ${STATE.console}... ⏳`, "bot");
     setControls(`<div class="loader">Cargando...</div>`);
     
     try {
-        // CAMBIO: Enviamos el nombre exacto de la consola (con encodeURIComponent por los espacios)
         const res = await fetch(`/api/gallery/${encodeURIComponent(STATE.console)}`);
         const images = await res.json();
         
@@ -287,30 +375,22 @@ def home():
             setControls(`<button class="btn secondary" onclick="startCustom()">🎨 Ir a Diseño Personalizado</button>`);
             return;
         }
-
         STATE.all_images = images;
-        renderBatch(1); // Renderizamos la primera tanda
-
+        renderBatch(1);
     } catch(e) {
         addBubble("Hubo un error cargando la galería. Vamos a personalizado.", "bot");
         setControls(`<button class="btn" onclick="startCustom()">Personalizado</button>`);
     }
   }
 
-  // CAMBIO: Función para renderizar por lotes de 10
   function renderBatch(batchNumber) {
     const limit = 10;
     const start = (batchNumber - 1) * limit;
     const end = start + limit;
-    
     const slice = STATE.all_images.slice(start, end);
     const hasMore = STATE.all_images.length > end;
 
-    // Mensaje AMIGABLE
-    let msg = "";
-    if(batchNumber === 1) msg = "¡Checa estos diseños brutales! 🔥";
-    else msg = "Aquí tienes más opciones exclusivas:";
-
+    let msg = batchNumber === 1 ? "¡Checa estos diseños brutales! 🔥" : "Aquí tienes más opciones exclusivas:";
     addBubble(msg, "bot");
     
     let html = `<div class="grid">`;
@@ -321,29 +401,22 @@ def home():
         </div>`;
     });
     html += `</div>`;
-    
     addBubble(html, "bot", true);
     
     let buttonsHtml = "";
-    
     if (hasMore) {
-        // Si hay más: Botón "Ver más"
         buttonsHtml = `
-            <div class="row">
-                <button class="btn secondary" onclick="renderBatch(${batchNumber + 1})">Ver más diseños</button>
-                <button class="btn secondary" onclick="startCustom()">Prefiero Personalizado</button>
-            </div>
+            <button class="btn secondary" style="margin-bottom:8px" onclick="renderBatch(${batchNumber + 1})">Ver más diseños</button>
+            <button class="btn secondary" onclick="startCustom()">Prefiero Personalizado</button>
         `;
     } else {
-        // Si es el final: Solo Personalizado y WA
         buttonsHtml = `
             <button class="btn secondary" onclick="startCustom()">🎨 Ninguno me convence, quiero personalizado</button>
-            <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp">💬 Contactar WhatsApp</a>
+            <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp" style="margin-top:8px">💬 Contactar WhatsApp</a>
         `;
     }
-
     setControls(buttonsHtml);
-    addBubble("Toca una imagen para seleccionar.", "bot");
+    addBubble("Toca una imagen para seleccionar y ver el precio.", "bot");
   }
 
   window.selectDesign = (el, url) => {
@@ -368,7 +441,7 @@ def home():
     available.forEach(c => {
         html += `
         <div class="combo-card" onclick="selectCombo(this, '${c.id}', ${c.price})">
-            <div class="combo-head"><span>${c.title}</span> <span>$${c.price.toLocaleString()}</span></div>
+            <div class="combo-head"><span>${c.title}</span> <span style="font-weight:bold">$${c.price.toLocaleString()}</span></div>
             <div class="tiny" style="color:#ccc">${c.desc}</div>
         </div>`;
     });
@@ -406,8 +479,8 @@ def home():
   }
 
   window.consultarCombo = () => {
-      const msg = `Hola, me interesa el combo para ${STATE.console}, pero tengo dudas.`;
-      window.open(`https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(msg)}`, '_blank');
+     const msg = `Hola, me interesa el combo para ${STATE.console}, pero tengo dudas.`;
+     window.open(`https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(msg)}`, '_blank');
   };
 
   // 4. DATOS Y CARGA
@@ -421,132 +494,142 @@ def home():
   };
 
   function renderCustomUploadForm(combo) {
-      const partes = combo.desc.split('+').map(p => p.trim()).join(", ");
-      addBubble(`☝️ Tu combo incluye: <b>${partes}</b>.<br>Puedes usar una imagen diferente para cada parte.`, "bot", true);
-      addBubble("Sube tus imágenes de referencia:", "bot");
+     const partes = combo.desc.split('+').map(p => p.trim()).join(", ");
+     addBubble(`☝️ Tu combo incluye: <b>${partes}</b>.<br>Puedes usar una imagen diferente para cada parte.`, "bot", true);
+     addBubble("Sube tus imágenes de referencia:", "bot");
 
-      setControls(`
-        <div id="uploadList"></div>
-        <button class="btn add" onclick="addUploadRow()">+ Agregar otra imagen</button>
-        <button class="btn" onclick="finishUploads()">Continuar</button>
-      `);
-      addUploadRow();
+     setControls(`
+       <div id="uploadList"></div>
+       <button class="btn add" onclick="addUploadRow()">+ Agregar otra imagen</button>
+       <button class="btn" onclick="finishUploads()">Continuar</button>
+     `);
+     addUploadRow();
   }
 
   window.addUploadRow = () => {
-      const container = document.getElementById("uploadList");
-      const idx = container.children.length + 1;
-      const div = document.createElement("div");
-      div.className = "upload-row";
-      div.innerHTML = `
-        <label>Imagen ${idx}</label>
-        <input type="file" class="file-in" accept="image/*">
-        <textarea class="desc-in" placeholder="¿En qué parte va esta imagen? (Ej: Frente, Arriba...)"></textarea>
-      `;
-      container.appendChild(div);
+     const container = document.getElementById("uploadList");
+     const idx = container.children.length + 1;
+     const div = document.createElement("div");
+     div.className = "upload-row";
+     div.innerHTML = `
+       <label>Imagen ${idx}</label>
+       <input type="file" class="file-in" accept="image/*">
+       <textarea class="desc-in" placeholder="¿En qué parte va esta imagen? (Ej: Frente, Arriba...)"></textarea>
+     `;
+     container.appendChild(div);
   };
 
   window.finishUploads = () => {
-      const rows = document.querySelectorAll(".upload-row");
-      const uploads = [];
-      let hasFile = false;
-      rows.forEach(row => {
-          const fileIn = row.querySelector(".file-in");
-          const descIn = row.querySelector(".desc-in");
-          if(fileIn.files.length > 0) {
-              hasFile = true;
-              uploads.push({ file: fileIn.files[0], detail: descIn.value.trim() || "Sin detalles" });
-          }
-      });
-      if (!hasFile) return showError("Sube al menos una imagen para continuar.");
-      STATE.custom_uploads = uploads;
-      addBubble(`✅ He adjuntado ${uploads.length} imágenes.`, "user");
-      renderShippingForm();
+     const rows = document.querySelectorAll(".upload-row");
+     const uploads = [];
+     let hasFile = false;
+     rows.forEach(row => {
+         const fileIn = row.querySelector(".file-in");
+         const descIn = row.querySelector(".desc-in");
+         if(fileIn.files.length > 0) {
+             hasFile = true;
+             uploads.push({ file: fileIn.files[0], detail: descIn.value.trim() || "Sin detalles" });
+         }
+     });
+     if (!hasFile) return showError("Sube al menos una imagen para continuar.");
+     STATE.custom_uploads = uploads;
+     addBubble(`✅ He adjuntado ${uploads.length} imágenes.`, "user");
+     renderShippingForm();
   };
 
   function renderShippingForm() {
-      addBubble("Para el envío gratis y pago contra entrega, necesito tus datos:", "bot");
-      setControls(`
-        <div style="background:#1e293b; padding:10px; border-radius:10px;">
-            <label class="tiny">Nombre completo de quien recibe (Nombre + Apellido):</label>
-            <input id="inReceiver" value="${STATE.name}" placeholder="Ej: Juan Pérez">
-            <label class="tiny">WhatsApp:</label>
-            <input id="inWa" type="tel" placeholder="300 123 4567">
-            <label class="tiny">Correo Electrónico:</label>
-            <input id="inEmail" type="email" placeholder="ejemplo@correo.com">
-            <label class="tiny">Ciudad:</label>
-            <input id="inCity" placeholder="Ej: Bogotá">
-            <label class="tiny">Barrio:</label>
-            <input id="inBarrio" placeholder="Ej: Chapinero">
-            <label class="tiny">Dirección Exacta:</label>
-            <input id="inAddress" placeholder="Cl 123 # 45-67 Apto 101">
-            <button class="btn ok" onclick="submitFinal()">✅ FINALIZAR PEDIDO</button>
-        </div>
-      `);
+     addBubble("Para el envío gratis y pago contra entrega, necesito tus datos:", "bot");
+     setControls(`
+       <div style="background:#1e293b; padding:10px; border-radius:10px;">
+           <label class="tiny">Nombre completo de quien recibe (Nombre + Apellido):</label>
+           <input id="inReceiver" value="${STATE.name}" placeholder="Ej: Juan Pérez">
+           <label class="tiny">WhatsApp:</label>
+           <input id="inWa" type="tel" placeholder="300 123 4567">
+           <label class="tiny">Correo Electrónico:</label>
+           <input id="inEmail" type="email" placeholder="ejemplo@correo.com">
+           <label class="tiny">Ciudad:</label>
+           <input id="inCity" placeholder="Ej: Bogotá">
+           <label class="tiny">Barrio:</label>
+           <input id="inBarrio" placeholder="Ej: Chapinero">
+           <label class="tiny">Dirección Exacta:</label>
+           <input id="inAddress" placeholder="Cl 123 # 45-67 Apto 101">
+           <button class="btn ok" onclick="submitFinal()">✅ FINALIZAR PEDIDO</button>
+       </div>
+     `);
   }
 
   async function submitFinal() {
-      const rec = document.getElementById("inReceiver").value.trim();
-      const wa = document.getElementById("inWa").value.trim();
-      const email = document.getElementById("inEmail").value.trim();
-      const city = document.getElementById("inCity").value.trim();
-      const bar = document.getElementById("inBarrio").value.trim();
-      const addr = document.getElementById("inAddress").value.trim();
+     const rec = document.getElementById("inReceiver").value.trim();
+     const wa = document.getElementById("inWa").value.trim();
+     const email = document.getElementById("inEmail").value.trim();
+     const city = document.getElementById("inCity").value.trim();
+     const bar = document.getElementById("inBarrio").value.trim();
+     const addr = document.getElementById("inAddress").value.trim();
 
-      if (rec.length < 5 || !rec.includes(" ")) return showError("Nombre y Apellido requeridos.");
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return showError("Correo inválido.");
-      const waClean = wa.replace(/[^0-9]/g, '');
-      if (waClean.length < 7) return showError("Número de WhatsApp inválido.");
-      if (!city || !bar || !addr) return showError("Falta ciudad, barrio o dirección.");
+     if (rec.length < 5 || !rec.includes(" ")) return showError("Nombre y Apellido requeridos.");
+     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return showError("Correo inválido.");
+     const waClean = wa.replace(/[^0-9]/g, '');
+     if (waClean.length < 7) return showError("Número de WhatsApp inválido.");
+     if (!city || !bar || !addr) return showError("Falta ciudad, barrio o dirección.");
 
-      STATE.receiver = rec; STATE.whatsapp = wa; STATE.email = email;
-      STATE.city = city; STATE.barrio = bar; STATE.address = addr;
+     STATE.receiver = rec; STATE.whatsapp = wa; STATE.email = email;
+     STATE.city = city; STATE.barrio = bar; STATE.address = addr;
 
-      addBubble("Enviando pedido... ⏳", "bot");
-      
-      const fd = new FormData();
-      fd.append("name", STATE.name);
-      fd.append("receiver_name", STATE.receiver);
-      fd.append("whatsapp", STATE.whatsapp);
-      fd.append("email", STATE.email);
-      fd.append("city", STATE.city);
-      fd.append("neighborhood", STATE.barrio);
-      fd.append("address", STATE.address);
-      fd.append("console", STATE.console);
-      
-      const t = (STATE.base_price || 0) + (STATE.extra_control ? 16000 : 0);
-      const combo = COMBOS.find(c => c.id === STATE.combo_id);
-      
-      let det = `Combo: ${combo.title}. Total: $${t.toLocaleString()}. `;
-      if (STATE.extra_control) det += " + Control Adicional.";
-      det += STATE.is_custom ? " [Personalizado]" : ` [Galería: ${STATE.design_url}]`;
-      
-      fd.append("design_choice", det);
-      fd.append("has_design", STATE.is_custom ? "true" : "false");
-      
-      if (STATE.is_custom && STATE.custom_uploads.length > 0) {
-          STATE.custom_uploads.forEach(u => {
-              fd.append("images", u.file);
-              fd.append("image_details", u.detail);
-          });
-      }
+     addBubble("Enviando pedido... ⏳", "bot");
+     
+     const fd = new FormData();
+     fd.append("name", STATE.name);
+     fd.append("receiver_name", STATE.receiver);
+     fd.append("whatsapp", STATE.whatsapp);
+     fd.append("email", STATE.email);
+     fd.append("city", STATE.city);
+     fd.append("neighborhood", STATE.barrio);
+     fd.append("address", STATE.address);
+     fd.append("console", STATE.console);
+     
+     const t = (STATE.base_price || 0) + (STATE.extra_control ? 16000 : 0);
+     const combo = COMBOS.find(c => c.id === STATE.combo_id);
+     
+     let det = `Combo: ${combo.title}. Total: $${t.toLocaleString()}. `;
+     if (STATE.extra_control) det += " + Control Adicional.";
+     det += STATE.is_custom ? " [Personalizado]" : ` [Galería: ${STATE.design_url}]`;
+     
+     fd.append("design_choice", det);
+     fd.append("has_design", STATE.is_custom ? "true" : "false");
+     
+     if (STATE.is_custom && STATE.custom_uploads.length > 0) {
+         STATE.custom_uploads.forEach(u => {
+             fd.append("images", u.file);
+             fd.append("image_details", u.detail);
+         });
+     }
 
-      try {
-          await fetch("/submit", { method: "POST", body: fd });
-          
-          if (STATE.is_custom) {
+     try {
+         // AQUÍ ESTABA EL ERROR: Ahora verificamos si el servidor responde OK
+         const res = await fetch("/submit", { method: "POST", body: fd });
+         
+         if (!res.ok) {
+            throw new Error("El servidor no pudo procesar el pedido.");
+         }
+         
+         // Si todo sale bien:
+         if (STATE.is_custom) {
              addBubble("✅ ¡Pedido Personalizado Recibido!", "bot");
              addBubble("Te enviaremos la propuesta de diseño por WhatsApp/Correo en máx 3 días.", "bot");
-          } else {
+         } else {
              addBubble("✅ ¡Pedido Confirmado!", "bot");
              addBubble("Te contactaremos al WhatsApp para el despacho.", "bot");
-          }
-          
-          const waText = `Hola, hice un pedido de ${combo.title} por $${t}. A nombre de ${STATE.receiver} en ${STATE.city}.`;
-          setControls(`<a href="https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(waText)}" class="btn whatsapp">Abrir WhatsApp</a>`);
-      } catch (e) {
-          addBubble("Error conectando. Envíanos los datos por WhatsApp.", "bot");
-      }
+         }
+         
+         const waText = `Hola, hice un pedido de ${combo.title} por $${t}. A nombre de ${STATE.receiver} en ${STATE.city}.`;
+         setControls(`<a href="https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(waText)}" class="btn whatsapp">Abrir WhatsApp</a>`);
+     } catch (e) {
+         console.error(e);
+         addBubble("Error conectando con el servidor.", "bot");
+         addBubble("Por favor, envíanos tus datos por WhatsApp manualmente:", "bot");
+         const waFail = `Hola, intenté pedir ${combo.title} pero la web falló. Mis datos son: ${STATE.receiver}, ${STATE.city}, ${STATE.address}.`;
+         setControls(`<a href="https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(waFail)}" class="btn whatsapp">Enviar por WhatsApp</a>`);
+     }
   }
 
   start();
@@ -554,6 +637,5 @@ def home():
 </body>
 </html>
 """
-    html = html.replace("__BUSINESS_WA_NUMBER__", BUSINESS_WHATSAPP_NUMBER)
-    return HTMLResponse(html)
-    
+    html_content = html_content.replace("__BUSINESS_WA_NUMBER__", BUSINESS_WHATSAPP_NUMBER)
+    return HTMLResponse(html_content)
