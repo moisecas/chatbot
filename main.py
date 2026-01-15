@@ -34,7 +34,7 @@ MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
 # -----------------------------
-# Funciones de Seguridad
+# Funciones de Seguridad y Helpers
 # -----------------------------
 def sanitize_input(text: str) -> str:
     if not text: return ""
@@ -101,13 +101,11 @@ def _send_email_sync(subject: str, body: str) -> None:
     if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD): 
         print("⚠️ No hay credenciales SMTP configuradas. No se envió el correo.")
         return
-    
     msg = EmailMessage()
     msg["From"] = SMTP_FROM
     msg["To"] = BUSINESS_EMAIL_TO
     msg["Subject"] = subject
     msg.set_content(body)
-    
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.starttls()
@@ -118,16 +116,13 @@ def _send_email_sync(subject: str, body: str) -> None:
         print(f"❌ Error enviando correo: {e}")
 
 # -----------------------------
-# API: Obtener Galería
+# Rutas API
 # -----------------------------
 @app.get("/api/gallery/{console_type}")
 async def get_gallery(console_type: str):
     images = await _get_gallery_images(console_type)
     return images
 
-# -----------------------------
-# API: Recibir Pedido (NUEVO)
-# -----------------------------
 @app.post("/submit")
 async def submit_lead(
     name: str = Form(...),
@@ -145,7 +140,6 @@ async def submit_lead(
 ):
     print(f"📥 Nuevo pedido recibido de: {name}")
 
-    # 1. Preparar datos para Supabase
     lead_data = {
         "name": name,
         "receiver_name": receiver_name,
@@ -159,46 +153,33 @@ async def submit_lead(
         "has_design": _truthy(has_design)
     }
 
-    # 2. Guardar Lead en DB
     new_lead = await _insert_lead(lead_data)
     if not new_lead:
         return JSONResponse(status_code=500, content={"error": "Error guardando en base de datos"})
 
     lead_id = new_lead.get("id")
     
-    # 3. Procesar Imágenes
     image_links_html = ""
     if _truthy(has_design) and images:
         details_list = image_details if image_details else []
-        
         for i, file_obj in enumerate(images):
             if not file_obj.filename: continue
-            
             ext = ALLOWED_IMAGE_TYPES.get(file_obj.content_type)
             if not ext: continue
-
             content = await file_obj.read()
             if len(content) > MAX_IMAGE_BYTES: continue
 
-            # Subir a Supabase Storage: leads/{id}/{uuid}.jpg
             filename = f"{uuid.uuid4()}{ext}"
             path = f"leads/{lead_id}/{filename}"
-            
             try:
                 await _upload_to_storage(SUPABASE_BUCKET, path, content, file_obj.content_type)
                 public_url = _make_public_url(SUPABASE_BUCKET, path)
-                
                 detail_text = details_list[i] if i < len(details_list) else "Sin detalle"
-                await _insert_lead_image({
-                    "lead_id": lead_id,
-                    "image_url": public_url,
-                    "detail": detail_text
-                })
+                await _insert_lead_image({"lead_id": lead_id, "image_url": public_url, "detail": detail_text})
                 image_links_html += f"\n- {detail_text}: {public_url}"
             except Exception as e:
                 print(f"Error subiendo imagen: {e}")
 
-    # 4. Enviar Correo
     email_body = f"""
     NUEVO PEDIDO - SKINS COLOMBIA
     -----------------------------
@@ -216,15 +197,13 @@ async def submit_lead(
     -----------------------------
     {image_links_html if image_links_html else "No adjuntó imágenes nuevas (Eligió de galería)."}
     """
-    
-    # Ejecutar envio de email en background
     subject = f"Pedido #{lead_id} - {console} - {receiver_name}"
     await run_in_threadpool(_send_email_sync, subject, email_body)
 
     return {"status": "ok", "lead_id": lead_id}
 
 # -----------------------------
-# Frontend
+# Frontend (HTML)
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -261,6 +240,8 @@ def home():
     .btn.whatsapp { background: #25D366; }
     .btn.ok { background: var(--ok); color: #000; }
     .btn.add { background: transparent; border: 1px dashed var(--muted); color: var(--muted); margin-bottom:10px; }
+    .btn-row { display: flex; gap: 8px; margin-top: 8px; } 
+    .btn-row .btn { margin-top: 0; font-size: 14px; padding: 10px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
     .card { border-radius: 8px; overflow: hidden; background: #000; position: relative; border: 2px solid transparent; cursor: pointer; }
     .card.selected { border-color: var(--ok); }
@@ -268,7 +249,6 @@ def home():
     .combo-card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
     .combo-card.active { border-color: var(--ok); background: rgba(34, 197, 94, 0.1); }
     .upload-row { background: rgba(255,255,255,0.05); padding: 10px; border-radius: 10px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.1); }
-    .upload-row label { display: block; font-size: 12px; color: var(--accent); margin-bottom: 4px; font-weight: bold; }
     .check-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 8px; }
     .check-row input { width: auto; margin: 0; }
     .tiny { font-size: 12px; color: var(--muted); }
@@ -297,6 +277,12 @@ def home():
     { id: "c7", title: "Combo 7 (Solo Series X)", price: 60000, desc: "4 Caras de la consola", only: ["Xbox Series X"] }
   ];
 
+  // TEXTOS PREGUNTAS FRECUENTES
+  const FAQ_INFO = {
+    install: "🧩 <b>Sobre la Instalación:</b><br>¡Es muy sencillo! El skin que recibirás incluye impreso un <b>Código QR</b>.<br><br>Solo debes escanearlo con tu celular y te abrirá el <b>video tutorial</b> paso a paso diseñado específicamente para que lo instales tú mismo sin burbujas ni errores.",
+    shipping: "🚚 <b>Tiempos y Envíos:</b><br>Como fabricamos bajo pedido para garantizar calidad fresca:<br>1️⃣ Tardamos <b>5 a 7 días hábiles</b> en fabricación.<br>2️⃣ Despachamos con transportadora (Interrapidísimo/Envía) y te generamos tu <b>Número de Guía</b> para rastreo.<br>3️⃣ ¡El envío es Gratis!"
+  };
+
   const STATE = { 
     name: "", console: "", design_url: "", combo_id: "", 
     extra_control: false, is_custom: false, base_price: 0, 
@@ -314,6 +300,11 @@ def home():
   }
   function setControls(html) { controls.innerHTML = html; }
   function showError(m) { addBubble("⚠️ "+m, "bot"); }
+
+  // Función para mostrar FAQ sin borrar botones
+  window.showFaq = (type) => {
+    addBubble(FAQ_INFO[type], "bot", true);
+  }
 
   // 1. INICIO
   function start() {
@@ -390,7 +381,7 @@ def home():
     const slice = STATE.all_images.slice(start, end);
     const hasMore = STATE.all_images.length > end;
 
-    let msg = batchNumber === 1 ? "¡Checa estos diseños brutales! 🔥" : "Aquí tienes más opciones exclusivas:";
+    let msg = batchNumber === 1 ? "¡Mira estos diseños! 🔥" : "Más diseños:";
     addBubble(msg, "bot");
     
     let html = `<div class="grid">`;
@@ -403,20 +394,32 @@ def home():
     html += `</div>`;
     addBubble(html, "bot", true);
     
+    // BOTONES DE ACCION + FAQ
     let buttonsHtml = "";
+    
+    // Fila 1: Navegación Principal
     if (hasMore) {
-        buttonsHtml = `
-            <button class="btn secondary" style="margin-bottom:8px" onclick="renderBatch(${batchNumber + 1})">Ver más diseños</button>
-            <button class="btn secondary" onclick="startCustom()">Prefiero Personalizado</button>
+        buttonsHtml += `
+            <button class="btn secondary" onclick="renderBatch(${batchNumber + 1})">Ver más diseños</button>
+            <button class="btn secondary" style="margin-top:8px" onclick="startCustom()">Prefiero Personalizado</button>
         `;
     } else {
-        buttonsHtml = `
-            <button class="btn secondary" onclick="startCustom()">🎨 Ninguno me convence, quiero personalizado</button>
-            <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp" style="margin-top:8px">💬 Contactar WhatsApp</a>
+        buttonsHtml += `
+            <button class="btn secondary" onclick="startCustom()">🎨 Quiero uno Personalizado</button>
+            <a href="https://wa.me/${BUSINESS_WA}" target="_blank" class="btn whatsapp" style="margin-top:8px">💬 Hablar por WhatsApp</a>
         `;
     }
+
+    // Fila 2: PREGUNTAS FRECUENTES (Siempre visibles)
+    buttonsHtml += `
+      <div class="btn-row">
+        <button class="btn secondary" onclick="showFaq('install')">❓ Instalación</button>
+        <button class="btn secondary" onclick="showFaq('shipping')">🚚 Envíos y Tiempos</button>
+      </div>
+    `;
+
     setControls(buttonsHtml);
-    addBubble("Toca una imagen para seleccionar y ver el precio.", "bot");
+    if(batchNumber === 1) addBubble("Toca una imagen para ver el precio.", "bot");
   }
 
   window.selectDesign = (el, url) => {
@@ -452,7 +455,11 @@ def home():
         <label for="chkExtra">Control adicional (+$16.000)</label>
       </div>
       <button class="btn ok" id="btnOrder" disabled onclick="askShippingData()">Seleccionar Combo</button>
-      <button class="btn whatsapp" onclick="consultarCombo()">Dudas del combo</button>
+      
+      <div class="btn-row">
+        <button class="btn secondary" onclick="showFaq('install')">❓ Instalación</button>
+        <button class="btn secondary" onclick="showFaq('shipping')">🚚 Envíos</button>
+      </div>
     `;
     
     addBubble("💰 Precios para " + STATE.console + ":", "bot");
@@ -477,11 +484,6 @@ def home():
      const t = (STATE.base_price || 0) + (STATE.extra_control ? 16000 : 0);
      document.getElementById("btnOrder").textContent = `Pedir ($${t.toLocaleString()})`;
   }
-
-  window.consultarCombo = () => {
-     const msg = `Hola, me interesa el combo para ${STATE.console}, pero tengo dudas.`;
-     window.open(`https://wa.me/${BUSINESS_WA}?text=${encodeURIComponent(msg)}`, '_blank');
-  };
 
   // 4. DATOS Y CARGA
   window.askShippingData = () => {
@@ -541,7 +543,7 @@ def home():
      addBubble("Para el envío gratis y pago contra entrega, necesito tus datos:", "bot");
      setControls(`
        <div style="background:#1e293b; padding:10px; border-radius:10px;">
-           <label class="tiny">Nombre completo de quien recibe (Nombre + Apellido):</label>
+           <label class="tiny">Nombre completo de quien recibe:</label>
            <input id="inReceiver" value="${STATE.name}" placeholder="Ej: Juan Pérez">
            <label class="tiny">WhatsApp:</label>
            <input id="inWa" type="tel" placeholder="300 123 4567">
@@ -605,14 +607,9 @@ def home():
      }
 
      try {
-         // AQUÍ ESTABA EL ERROR: Ahora verificamos si el servidor responde OK
          const res = await fetch("/submit", { method: "POST", body: fd });
+         if (!res.ok) throw new Error("El servidor no pudo procesar el pedido.");
          
-         if (!res.ok) {
-            throw new Error("El servidor no pudo procesar el pedido.");
-         }
-         
-         // Si todo sale bien:
          if (STATE.is_custom) {
              addBubble("✅ ¡Pedido Personalizado Recibido!", "bot");
              addBubble("Te enviaremos la propuesta de diseño por WhatsApp/Correo en máx 3 días.", "bot");
